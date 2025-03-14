@@ -1,0 +1,12 @@
+# traffic-split.yaml
+apiVersion: split.smi-spec.io/v1alpha1
+kind: TrafficSplit
+metadata:
+  name: ml-model-ab-test
+spec:
+  service: ml-model-service
+  backends:
+    - service: ml-model-v1
+      weight: 50
+    - service: ml-model-v2
+      weight: 50

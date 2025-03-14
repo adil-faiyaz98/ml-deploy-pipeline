@@ -1,0 +1,27 @@
+# canary-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ml-model-canary
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ml-model-canary
+  template:
+    metadata:
+      labels:
+        app: ml-model-canary
+    spec:
+      containers:
+      - name: ml-model
+        image: your-docker-repo/ml-model:latest
+        resources:
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+        ports:
+        - containerPort: 8080
