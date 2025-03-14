@@ -1,0 +1,162 @@
+# GitHub Actions CI/CD Pipeline for ML Model Deployment with Security, Logging, Cost Optimization, and Model Versioning
+
+name: ML Model Secure CI/CD
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build:
+    name: Build and Test Model
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v2
+
+      - name: Set up Python
+        uses: actions/setup-python@v2
+        with:
+          python-version: '3.9'
+
+      - name: Install Dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run Unit Tests
+        run: |
+          pytest tests/
+
+      - name: Scan Dependencies for Vulnerabilities
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "python:3.9"
+          format: "table"
+          exit-code: "1"
+
+  dataset_versioning:
+    name: Dataset Versioning with DVC
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v2
+      
+      - name: Set Up DVC
+        run: |
+          pip install dvc[s3]
+          dvc pull
+      
+      - name: Commit Dataset Changes
+        run: |
+          dvc add data/
+          git add data.dvc .gitignore
+          git commit -m "Updated dataset version"
+          git push origin main
+          dvc push
+
+  deploy:
+    needs: [build, dataset_versioning]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Retrieve Kubernetes Secrets from AWS Secrets Manager
+        run: |
+          aws secretsmanager get-secret-value --secret-id ml-k8s-secrets --query SecretString --output text > kubernetes/secrets.env
+          export $(cat kubernetes/secrets.env | xargs)
+
+      - name: Deploy to Kubernetes Cluster
+        run: |
+          kubectl apply -f kubernetes/deployment.yaml
+          kubectl apply -f kubernetes/service.yaml
+          kubectl apply -f kubernetes/hpa.yaml
+          kubectl apply -f kubernetes/ingress.yaml
+          kubectl apply -f kubernetes/secrets.yaml
+
+      - name: Optimize Costs with Spot Instances
+        run: |
+          eksctl create nodegroup --cluster ml-cluster --name spot-nodes --instance-types=m5.large --spot
+
+  model_versioning:
+    name: Model Versioning with MLflow
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Track Model Version in MLflow
+        run: |
+          export MLFLOW_TRACKING_URI=http://mlflow-server:5000
+          mlflow models serve -m "models:/ml_model/latest"
+
+      - name: Store Model in Feature Store
+        run: |
+          pip install feast
+          feast apply
+
+  security_scan:
+    name: Security Scanning
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v2
+      
+      - name: Run Trivy Security Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: "fs"
+          exit-code: "1"
+          format: "table"
+
+      - name: Run Snyk Code Security Scan
+        uses: snyk/actions/python@master
+        with:
+          args: "--severity-threshold=high"
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+  monitor:
+    needs: model_versioning
+    runs-on: ubuntu-latest
+    steps:
+      - name: Monitor Model Performance
+        run: |
+          python monitoring/model_monitoring.sh
+
+      - name: Detect Model Drift
+        run: |
+          python retraining/drift_detection.py
+
+  logging:
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure Cloud Logging
+        run: |
+          aws logs create-log-group --log-group-name /aws/ml_model_logs || true
+          aws logs create-log-stream --log-group-name /aws/ml_model_logs --log-stream-name inference_logs || true
+          echo "Cloud Logging Configured"
+
+      - name: Send Logs to AWS CloudWatch
+        run: |
+          tail -n 100 logs/model_logs.log | aws logs put-log-events --log-group-name /aws/ml_model_logs --log-stream-name inference_logs --log-events '[{"timestamp": '$(date +%s000)', "message": "Model log data"}]'
+
+      - name: Integrate with Loki Logging
+        run: |
+          curl -X POST -H "Content-Type: application/json" -d '{"streams": [{"stream": {"job": "ml_model"}, "values": [["$(date +%s%N)", "Model log data"]]}]}' http://loki:3100/loki/api/v1/push
+
+  rollback:
+    needs: monitor
+    runs-on: ubuntu-latest
+    if: failure()
+    steps:
+      - name: Rollback to Previous Model Version
+        run: |
+          python rollback/rollback_model.py

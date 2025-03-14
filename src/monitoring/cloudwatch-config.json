@@ -1,0 +1,7 @@
+{
+    "logs": {
+      "logGroupName": "/aws/ml_model_logs",
+      "logStreamName": "inference_logs",
+      "region": "us-east-1"
+    }
+  }

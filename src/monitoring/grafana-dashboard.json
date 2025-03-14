@@ -1,0 +1,21 @@
+{
+  "dashboard": {
+    "title": "ML Model Performance",
+    "panels": [
+      {
+        "type": "graph",
+        "title": "Model Latency",
+        "targets": [
+          { "expr": "model_latency_seconds", "legendFormat": "Latency" }
+        ]
+      },
+      {
+        "type": "graph",
+        "title": "Model Accuracy",
+        "targets": [
+          { "expr": "model_accuracy", "legendFormat": "Accuracy" }
+        ]
+      }
+    ]
+  }
+}

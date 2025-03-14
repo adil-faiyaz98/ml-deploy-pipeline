@@ -1,0 +1,14 @@
+# Kubernetes Service for ML Model (service.yaml)
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: ml-model-service
+spec:
+  type: LoadBalancer
+  selector:
+    app: ml-model
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 8080
