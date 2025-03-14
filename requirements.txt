@@ -1,9 +1,4 @@
-# ml-deploy-pipeline
-Docker Compose + CI/CD pipeline for ML deployment
-
-
-## This framework utilizes the following libraries
-### Core ML/AI Libraries
+# Core ML Libraries
 scikit-learn
 tensorflow
 numpy
@@ -11,7 +6,7 @@ pandas
 matplotlib
 seaborn
 
-### Deep Learning & Advanced ML
+# Deep Learning & Advanced ML
 pytorch 
 torchvision
 transformers

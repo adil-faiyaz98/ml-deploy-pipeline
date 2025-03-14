@@ -1,0 +1,226 @@
+# Model API Helm Chart Configuration
+replicaCount: 2
+
+image:
+  repository: ${CONTAINER_REGISTRY_URL}/model-api
+  tag: ${MODEL_API_VERSION}
+  pullPolicy: Always
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations:
+    ${IAM_ROLE_ANNOTATION_KEY}: ${IAM_ROLE_ANNOTATION_VALUE}
+  name: "model-api"
+
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/path: "/metrics"
+  prometheus.io/port: "8000"
+
+securityContext:
+  capabilities:
+    drop:
+    - ALL
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 1000
+  allowPrivilegeEscalation: false
+
+service:
+  type: ClusterIP
+  port: 8000
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/path: "/metrics"
+    prometheus.io/port: "8000"
+
+resources:
+  limits:
+    cpu: 2
+    memory: 4Gi
+  requests:
+    cpu: 1
+    memory: 2Gi
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 80
+  targetMemoryUtilizationPercentage: 80
+
+livenessProbe:
+  httpGet:
+    path: /health
+    port: http
+  initialDelaySeconds: 60
+  periodSeconds: 15
+  timeoutSeconds: 10
+  failureThreshold: 3
+  successThreshold: 1
+  
+readinessProbe:
+  httpGet:
+    path: /health
+    port: http
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+  successThreshold: 1
+
+startupProbe:
+  httpGet:
+    path: /health
+    port: http
+  initialDelaySeconds: 10
+  periodSeconds: 5
+  timeoutSeconds: 5
+  failureThreshold: 12
+  successThreshold: 1
+
+nodeSelector: {}
+
+tolerations:
+- key: "ml-workload"
+  operator: "Equal"
+  value: "true"
+  effect: "NoSchedule"
+
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+    - weight: 100
+      podAffinityTerm:
+        labelSelector:
+          matchExpressions:
+          - key: app.kubernetes.io/name
+            operator: In
+            values:
+            - model-api
+        topologyKey: "kubernetes.io/hostname"
+
+ingress:
+  enabled: true
+  className: "nginx"
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+  hosts:
+    - host: api.${DOMAIN_NAME}
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: model-api-tls
+      hosts:
+        - api.${DOMAIN_NAME}
+
+env:
+  - name: MODEL_DIR
+    value: /models
+  - name: LOG_LEVEL
+    value: INFO
+  - name: DATABASE_URI
+    valueFrom:
+      secretKeyRef:
+        name: model-api-secrets
+        key: database_uri
+  - name: REDIS_URI
+    valueFrom:
+      secretKeyRef:
+        name: model-api-secrets
+        key: redis_uri
+  - name: MLFLOW_TRACKING_URI
+    value: ${MLFLOW_URI}
+  - name: ENABLE_AUTH
+    value: "true"
+  - name: PROMETHEUS_MULTIPROC_DIR
+    value: /tmp
+  - name: API_WORKERS
+    value: "4"
+
+envFrom:
+  - secretRef:
+      name: model-api-env
+
+volumeMounts:
+  - name: models
+    mountPath: /models
+    readOnly: true
+  - name: config
+    mountPath: /app/config
+    readOnly: true
+  - name: tmp
+    mountPath: /tmp
+  - name: logs
+    mountPath: /app/logs
+
+volumes:
+  - name: models
+    persistentVolumeClaim:
+      claimName: models-pvc
+  - name: config
+    configMap:
+      name: model-api-config
+  - name: tmp
+    emptyDir: {}
+  - name: logs
+    emptyDir: {}
+
+extraConfigmaps:
+  model-api-config:
+    model_config.json: |
+      {
+        "api": {
+          "host": "0.0.0.0",
+          "port": 8000,
+          "cors_origins": ["*"],
+          "workers": 4
+        },
+        "models": {
+          "dir": "/models",
+          "default_version": "latest",
+          "auto_reload": true,
+          "reload_interval": 60
+        },
+        "security": {
+          "enabled": true,
+          "api_key_header": "X-API-Key"
+        },
+        "logging": {
+          "level": "info",
+          "request_logging": true
+        },
+        "performance": {
+          "batch_size": 32,
+          "cache_predictions": true,
+          "cache_size": 1024
+        }
+      }
+
+networkPolicy:
+  enabled: true
+  spec:
+    ingress:
+      - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: nginx-ingress
+        ports:
+        - protocol: TCP
+          port: 8000
+      - from:
+        - namespaceSelector:
+            matchLabels:
+              name: monitoring
+        ports:
+        - protocol: TCP
+          port: 8000

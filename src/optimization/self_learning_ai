@@ -1,0 +1,23 @@
+# optimization/self_learning_ai.py
+import logging
+import numpy as np
+import tensorflow as tf
+
+logging.basicConfig(filename='logs/self_learning_ai.log', level=logging.INFO)
+
+# Load model
+model = tf.keras.models.load_model("models/ml_model.h5")
+
+# AI optimizing AI: Auto-adjust hyperparameters
+def optimize_model(model):
+    learning_rates = [0.001, 0.005, 0.01]
+    best_lr = np.random.choice(learning_rates)  # Simulate AI selection
+    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=best_lr),
+                  loss='binary_crossentropy', metrics=['accuracy'])
+    logging.info(f"Optimized learning rate: {best_lr}")
+    return model
+
+optimized_model = optimize_model(model)
+optimized_model.save("models/optimized_ml_model.h5")
+logging.info("Self-learning AI optimization completed.")
+print("Self-learning AI optimization complete.")

@@ -1,0 +1,124 @@
+# Elasticsearch configuration
+elasticsearch:
+  replicas: 3
+  minimumMasterNodes: 2
+  
+  resources:
+    requests:
+      cpu: "1"
+      memory: "2Gi"
+    limits:
+      cpu: "2"
+      memory: "4Gi"
+      
+  volumeClaimTemplate:
+    accessModes: [ "ReadWriteOnce" ]
+    resources:
+      requests:
+        storage: 100Gi
+    storageClassName: gp2
+    
+  esConfig:
+    elasticsearch.yml: |
+      xpack.security.enabled: true
+      xpack.monitoring.collection.enabled: true
+  
+  esJavaOpts: "-Xmx2g -Xms2g"
+  
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+    
+  podSecurityContext:
+    runAsNonRoot: true
+  
+  securityConfig:
+    enabled: true
+    passwordSecret: "elasticsearch-credentials"
+    
+  antiAffinity: "soft"
+  
+  tolerations:
+    - key: "monitoring"
+      operator: "Equal"
+      value: "true"
+      effect: "NoSchedule"
+
+# Kibana configuration
+kibana:
+  replicas: 1
+  
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: 1
+      memory: 2Gi
+      
+  securityContext:
+    runAsUser: 1000
+    
+  kibanaConfig:
+    kibana.yml: |
+      server.basePath: ""
+      xpack.monitoring.enabled: true
+      xpack.security.enabled: true
+      xpack.reporting.enabled: true
+      
+  ingress:
+    enabled: true
+    annotations:
+      kubernetes.io/ingress.class: nginx
+      cert-manager.io/cluster-issuer: letsencrypt-prod
+      nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    hosts:
+      - host: kibana.example.com
+        paths:
+          - path: /
+    tls:
+      - secretName: kibana-tls
+        hosts:
+          - kibana.example.com
+
+# Filebeat configuration
+filebeat:
+  enabled: true
+  
+  filebeatConfig:
+    filebeat.yml: |
+      filebeat.inputs:
+      - type: container
+        paths:
+          - /var/log/containers/*.log
+        processors:
+          - add_kubernetes_metadata:
+              host: ${NODE_NAME}
+              matchers:
+              - logs_path:
+                  logs_path: "/var/log/containers/"
+      
+      output.elasticsearch:
+        hosts: ['${ELASTICSEARCH_HOST:elasticsearch-master}:${ELASTICSEARCH_PORT:9200}']
+        username: ${ELASTICSEARCH_USERNAME}
+        password: ${ELASTICSEARCH_PASSWORD}
+        
+      setup.kibana:
+        host: "kibana-kibana:5601"
+  
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+      
+  tolerations:
+    - key: node-role.kubernetes.io/master
+      effect: NoSchedule
+      
+  securityContext:
+    runAsUser: 0
+    privileged: true

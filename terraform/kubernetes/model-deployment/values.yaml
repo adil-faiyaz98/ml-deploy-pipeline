@@ -1,0 +1,293 @@
+# Global values for all deployments
+global:
+  environment: dev
+  cloudProvider: aws  # aws, azure, gcp
+  domain: ml-deploy.example.com
+  images:
+    pullPolicy: Always
+    registry: ${CONTAINER_REGISTRY}
+  
+  # Cloud provider specific settings
+  aws:
+    region: us-west-2
+    serviceAccountAnnotation: eks.amazonaws.com/role-arn
+    storageClass: gp2
+  
+  azure:
+    location: eastus
+    serviceAccountAnnotation: azure.workload.identity/client-id
+    storageClass: managed-premium
+  
+  gcp:
+    region: us-central1
+    serviceAccountAnnotation: iam.gke.io/gcp-service-account
+    storageClass: standard
+
+# Model API configuration
+modelApi:
+  enabled: true
+  name: model-api
+  replicaCount: 2
+  
+  image:
+    repository: model-api
+    tag: latest
+  
+  service:
+    type: ClusterIP
+    port: 8000
+  
+  ingress:
+    enabled: true
+    annotations:
+      kubernetes.io/ingress.class: nginx
+      cert-manager.io/cluster-issuer: letsencrypt-prod
+    path: /
+    host: api.${domain}
+  
+  resources:
+    limits:
+      cpu: 2
+      memory: 4Gi
+    requests:
+      cpu: 1
+      memory: 2Gi
+  
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 80
+  
+  # Persistent storage for models
+  persistence:
+    enabled: true
+    accessMode: ReadWriteMany
+    size: 10Gi
+  
+  # Security settings
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+  
+  # Monitoring settings
+  monitoring:
+    enabled: true
+    scrape: true
+    path: /metrics
+    port: 8000
+
+# MLflow configuration
+mlflow:
+  enabled: true
+  name: mlflow
+  replicaCount: 1
+  
+  image:
+    repository: mlflow
+    tag: latest
+  
+  service:
+    type: ClusterIP
+    port: 5000
+  
+  ingress:
+    enabled: true
+    annotations:
+      kubernetes.io/ingress.class: nginx
+      cert-manager.io/cluster-issuer: letsencrypt-prod
+    path: /
+    host: mlflow.${domain}
+  
+  resources:
+    limits:
+      cpu: 1
+      memory: 2Gi
+    requests:
+      cpu: 500m
+      memory: 1Gi
+  
+  # Database connection
+  database:
+    type: postgres
+    host: ${DB_HOST}
+    port: 5432
+    name: mlflow
+    user: mlflow
+  
+  # Artifact storage
+  artifacts:
+    type: s3  # s3, azure-blob, gcs
+    path: mlflow
+    # Cloud provider specific settings filled in via templates
+
+# Model training jobs
+modelTraining:
+  enabled: true
+  schedule: "0 0 * * *"  # Daily at midnight
+  image:
+    repository: model-trainer
+    tag: latest
+  
+  resources:
+    limits:
+      cpu: 4
+      memory: 16Gi
+    requests:
+      cpu: 2
+      memory: 8Gi
+  
+  # Use GPU for training
+  gpu:
+    enabled: false
+    type: nvidia-tesla-t4
+    count: 1
+  
+  # Data sources# filepath: c:\Users\adilm\repositories\Go\ml-deploy-pipeline\terraform\kubernetes\model-deployment\values.yaml
+
+# Global values for all deployments
+global:
+  environment: dev
+  cloudProvider: aws  # aws, azure, gcp
+  domain: ml-deploy.example.com
+  images:
+    pullPolicy: Always
+    registry: ${CONTAINER_REGISTRY}
+  
+  # Cloud provider specific settings
+  aws:
+    region: us-west-2
+    serviceAccountAnnotation: eks.amazonaws.com/role-arn
+    storageClass: gp2
+  
+  azure:
+    location: eastus
+    serviceAccountAnnotation: azure.workload.identity/client-id
+    storageClass: managed-premium
+  
+  gcp:
+    region: us-central1
+    serviceAccountAnnotation: iam.gke.io/gcp-service-account
+    storageClass: standard
+
+# Model API configuration
+modelApi:
+  enabled: true
+  name: model-api
+  replicaCount: 2
+  
+  image:
+    repository: model-api
+    tag: latest
+  
+  service:
+    type: ClusterIP
+    port: 8000
+  
+  ingress:
+    enabled: true
+    annotations:
+      kubernetes.io/ingress.class: nginx
+      cert-manager.io/cluster-issuer: letsencrypt-prod
+    path: /
+    host: api.${domain}
+  
+  resources:
+    limits:
+      cpu: 2
+      memory: 4Gi
+    requests:
+      cpu: 1
+      memory: 2Gi
+  
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 80
+  
+  # Persistent storage for models
+  persistence:
+    enabled: true
+    accessMode: ReadWriteMany
+    size: 10Gi
+  
+  # Security settings
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+  
+  # Monitoring settings
+  monitoring:
+    enabled: true
+    scrape: true
+    path: /metrics
+    port: 8000
+
+# MLflow configuration
+mlflow:
+  enabled: true
+  name: mlflow
+  replicaCount: 1
+  
+  image:
+    repository: mlflow
+    tag: latest
+  
+  service:
+    type: ClusterIP
+    port: 5000
+  
+  ingress:
+    enabled: true
+    annotations:
+      kubernetes.io/ingress.class: nginx
+      cert-manager.io/cluster-issuer: letsencrypt-prod
+    path: /
+    host: mlflow.${domain}
+  
+  resources:
+    limits:
+      cpu: 1
+      memory: 2Gi
+    requests:
+      cpu: 500m
+      memory: 1Gi
+  
+  # Database connection
+  database:
+    type: postgres
+    host: ${DB_HOST}
+    port: 5432
+    name: mlflow
+    user: mlflow
+  
+  # Artifact storage
+  artifacts:
+    type: s3  # s3, azure-blob, gcs
+    path: mlflow
+    # Cloud provider specific settings filled in via templates
+
+# Model training jobs
+modelTraining:
+  enabled: true
+  schedule: "0 0 * * *"  # Daily at midnight
+  image:
+    repository: model-trainer
+    tag: latest
+  
+  resources:
+    limits:
+      cpu: 4
+      memory: 16Gi
+    requests:
+      cpu: 2
+      memory: 8Gi
+  
+  # Use GPU for training
+  gpu:
+    enabled: false
+    type: nvidia-tesla-t4
+    count: 1
+  
+  # Data sources

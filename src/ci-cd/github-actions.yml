@@ -1,329 +1,585 @@
-# GitHub Actions CI/CD Pipeline for ML Model Deployment with Security, Logging, Cost Optimization, and Model Versioning
+# Enterprise-Grade ML Model CI/CD Pipeline with Security, Governance & Multi-environment Deployment
 
-name: ML Model Secure CI/CD
+name: ML Model Enterprise CI/CD
 
+# Workflow trigger configuration
 on:
   push:
-    branches:
-      - main
+    branches: [main, develop]
+    paths:
+      - 'src/**'
+      - 'models/**'
+      - 'data/**/*.csv'
+      - 'data/**/*.dvc'
+      - 'config/**'
   pull_request:
-    branches:
-      - main
+    branches: [main, develop]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - development
+          - staging
+          - production
+
+# Environment variables used across jobs
+env:
+  PYTHON_VERSION: '3.9'
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  MODEL_VERSION: ${{ github.sha }}
+  METADATA_PATH: metadata/run-${{ github.run_id }}.json
+
+# Define workflow concurrency to prevent parallel runs on the same ref
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build:
-    name: Build and Test Model
+  # ========== QUALITY & VALIDATION ==========
+  validate:
+    name: Validate Code & Data
     runs-on: ubuntu-latest
+    outputs:
+      model_quality: ${{ steps.model_quality_check.outputs.quality_passed }}
+      data_quality: ${{ steps.data_quality_check.outputs.quality_passed }}
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v2
-
-      - name: Set up Python
-        uses: actions/setup-python@v2
+        uses: actions/checkout@v3
         with:
-          python-version: '3.9'
+          fetch-depth: 0  # Fetch all history for proper versioning
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Lint Code
+        run: |
+          flake8 src/ tests/
+          black --check src/ tests/
+          isort --check src/ tests/
+
+      - name: Static Type Checking
+        run: |
+          mypy src/
+
+      - name: Data Quality Check
+        id: data_quality_check
+        run: |
+          python -m src.validation.data_quality \
+            --input-data data/training_data.csv \
+            --output-report reports/data_quality.json \
+            --threshold 0.95
+          
+          # Check if quality passes threshold
+          quality_score=$(jq '.overall_score' reports/data_quality.json)
+          echo "Quality score: $quality_score"
+          
+          if (( $(echo "$quality_score >= 0.95" | bc -l) )); then
+            echo "quality_passed=true" >> $GITHUB_OUTPUT
+          else
+            echo "quality_passed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run Unit Tests
+        run: |
+          pytest tests/unit/ --cov=src --cov-report=xml:coverage.xml
+
+      - name: Upload Code Coverage
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./coverage.xml
+
+  # ========== DATA & MODEL VERSIONING ==========
+  dataset_versioning:
+    name: Version & Track Datasets
+    runs-on: ubuntu-latest
+    needs: validate
+    if: needs.validate.outputs.data_quality == 'true'
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install DVC
+        run: |
+          pip install "dvc[s3]>=2.10.0" dvc-gdrive dvc-gs dvc-azure
+
+      - name: Configure DVC Remote
+        run: |
+          dvc remote modify myremote access_key_id ${{ secrets.AWS_ACCESS_KEY_ID }}
+          dvc remote modify myremote secret_access_key ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      - name: Pull DVC Data
+        run: |
+          dvc pull -v
+
+      - name: Track New Data
+        id: track_data
+        run: |
+          # Check if data has changed
+          if [[ -n "$(git status --porcelain data/)" ]]; then
+            dvc add data/
+            git add data.dvc .gitignore
+            git config --local user.email "actions@github.com"
+            git config --local user.name "GitHub Actions"
+            git commit -m "Update dataset version [skip ci]" || echo "No changes to commit"
+            echo "data_updated=true" >> $GITHUB_OUTPUT
+          else
+            echo "No data changes detected"
+            echo "data_updated=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Push Data to DVC Remote
+        if: steps.track_data.outputs.data_updated == 'true'
+        run: |
+          dvc push -v
+          git push origin ${GITHUB_REF#refs/heads/}
+
+      - name: Record Data Lineage
+        run: |
+          mkdir -p metadata
+          dvc experiments show --json > metadata/data_lineage.json
+          aws s3 cp metadata/data_lineage.json s3://ml-metadata-${{ github.repository_owner }}/data_lineage/$(date +%Y-%m-%d)/data_lineage.json
+
+  # ========== MODEL TRAINING & EVALUATION ==========
+  train:
+    name: Train & Evaluate Model
+    runs-on: ubuntu-latest
+    needs: dataset_versioning
+    outputs:
+      model_performance: ${{ steps.evaluate_model.outputs.model_performance }}
+      model_uri: ${{ steps.save_to_registry.outputs.model_uri }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
 
       - name: Install Dependencies
         run: |
           pip install -r requirements.txt
+          pip install mlflow>=2.0.0 optuna>=3.0.0 pytest-benchmark>=4.0.0
 
-      - name: Run Unit Tests
+      - name: Pull DVC Data
         run: |
-          pytest tests/
+          pip install "dvc[s3]>=2.10.0"
+          dvc pull -v
 
-      - name: Scan Dependencies for Vulnerabilities
-        uses: aquasecurity/trivy-action@master
+      - name: Start MLflow Tracking Server
+        run: |
+          mlflow server --backend-store-uri sqlite:///mlflow.db --default-artifact-root ./artifacts --host 0.0.0.0 &
+          echo "MLFLOW_TRACKING_URI=http://localhost:5000" >> $GITHUB_ENV
+          # Wait for server to start
+          sleep 5
+
+      - name: Hyperparameter Optimization
+        run: |
+          python src/training/hyperparameter_optimization.py \
+            --config config/training.yaml \
+            --study-name hp-opt-${{ github.run_id }} \
+            --n-trials 20 \
+            --timeout 3600
+
+      - name: Train Model
+        id: train_model
+        run: |
+          python src/training/train.py \
+            --config config/training.yaml \
+            --output-dir models/ \
+            --experiment-name ${{ github.workflow }} \
+            --run-name run-${{ github.run_id }} \
+            --register-model-name ${{ env.IMAGE_NAME }}-model
+          
+          # Extract model info from training output
+          MODEL_PATH=$(find models -name "*.pkl" | sort -n | tail -1)
+          echo "model_path=$MODEL_PATH" >> $GITHUB_OUTPUT
+
+      - name: Evaluate Model
+        id: evaluate_model
+        run: |
+          python src/evaluation/evaluate.py \
+            --model-path ${{ steps.train_model.outputs.model_path }} \
+            --test-data data/test_data.csv \
+            --output-dir reports/
+          
+          # Extract metrics from evaluation output
+          cat reports/metrics.json | jq -r '.["test_accuracy"]' > test_accuracy.txt
+          MODEL_PERFORMANCE=$(cat test_accuracy.txt)
+          
+          # For full metrics in next jobs
+          cp reports/metrics.json ${{ env.METADATA_PATH }}
+          echo "model_performance=$MODEL_PERFORMANCE" >> $GITHUB_OUTPUT
+          
+          # Fail if model performance is below threshold
+          if (( $(echo "$MODEL_PERFORMANCE < 0.75" | bc -l) )); then
+            echo "Model performance below threshold: $MODEL_PERFORMANCE"
+            exit 1
+          fi
+
+      - name: Save Model to Registry
+        id: save_to_registry
+        run: |
+          # Register model with MLflow
+          MODEL_URI=$(python src/deployment/register_model.py \
+            --model-path ${{ steps.train_model.outputs.model_path }} \
+            --model-name ${{ env.IMAGE_NAME }}-model \
+            --model-version ${{ env.MODEL_VERSION }} \
+            --metadata-path ${{ env.METADATA_PATH }})
+            
+          echo "model_uri=$MODEL_URI" >> $GITHUB_OUTPUT
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v3
         with:
-          image-ref: "python:3.9"
-          format: "table"
-          exit-code: "1"
+          name: model-artifacts
+          path: |
+            models/
+            reports/
+            ${{ env.METADATA_PATH }}
+            mlflow.db
 
-  dataset_versioning:
-    name: Dataset Versioning with DVC
+  # ========== SECURITY SCANNING ==========
+  security:
+    name: Security Scanning
     runs-on: ubuntu-latest
+    needs: validate
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v2
-      
-      - name: Set Up DVC
+        uses: actions/checkout@v3
+        
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          
+      - name: Install Security Tools
         run: |
-          pip install dvc[s3]
-          dvc pull
-      
-      - name: Commit Dataset Changes
-        run: |
-          dvc add data/
-          git add data.dvc .gitignore
-          git commit -m "Updated dataset version"
-          git push origin main
-          dvc push
+          pip install bandit safety
 
-  deploy:
-    needs: [build, dataset_versioning]
+      - name: Python Dependency Scan
+        run: safety check -r requirements.txt --full-report -o text
+
+      - name: Python Static Security Analysis
+        run: |
+          bandit -r src/ -f json -o bandit-results.json || true
+          # Fail if high severity issues are found
+          if [[ $(jq '.results | map(select(.issue_severity == "HIGH")) | length' bandit-results.json) -gt 0 ]]; then
+            echo "High severity security issues found"
+            exit 1
+          fi
+          
+      - name: Run Trivy Vulnerability Scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          exit-code: '1'
+          severity: 'CRITICAL,HIGH'
+          
+      - name: Upload Trivy Results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  # ========== CONTAINER BUILD ==========
+  build:
+    name: Build & Push Container
+    needs: [train, security]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image_digest: ${{ steps.build_push.outputs.digest }}
     steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+        
+      - name: Download Model Artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: model-artifacts
+          path: ./
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+          
+      - name: Extract Metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=sha,format=short
+            type=ref,event=branch
+            
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+        
+      - name: Build and Push Docker Image
+        id: build_push
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            MODEL_PATH=${{ steps.train_model.outputs.model_path }}
+            MODEL_VERSION=${{ env.MODEL_VERSION }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+          
+      - name: Scan Container for Vulnerabilities
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          format: 'table'
+          exit-code: '1'
+          severity: 'CRITICAL'
+
+  # ========== STAGING DEPLOYMENT ==========
+  deploy-staging:
+    name: Deploy to Staging
+    needs: [build, train]
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+      url: https://staging-api.example.com
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+        
+      - name: Setup Kubernetes Tools
+        uses: azure/setup-kubectl@v3
+        
       - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v1
+        uses: aws-actions/configure-aws-credentials@v2
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: us-east-1
-
-      - name: Retrieve Kubernetes Secrets from AWS Secrets Manager
+          aws-region: ${{ vars.AWS_REGION }}
+          
+      - name: Connect to EKS Cluster
         run: |
-          aws secretsmanager get-secret-value --secret-id ml-k8s-secrets --query SecretString --output text > kubernetes/secrets.env
-          export $(cat kubernetes/secrets.env | xargs)
-
-      - name: Deploy to Kubernetes Cluster
+          aws eks update-kubeconfig --name staging-ml-cluster --region ${{ vars.AWS_REGION }}
+          
+      - name: Generate Kubernetes Manifests
         run: |
-          kubectl apply -f kubernetes/deployment.yaml
-          kubectl apply -f kubernetes/service.yaml
-          kubectl apply -f kubernetes/hpa.yaml
-          kubectl apply -f kubernetes/ingress.yaml
-          kubectl apply -f kubernetes/secrets.yaml
-
-      - name: Optimize Costs with Spot Instances
+          mkdir -p k8s-manifests
+          # Use model performance to set resource allocation
+          MODEL_PERFORMANCE="${{ needs.train.outputs.model_performance }}"
+          
+          # Dynamically generate deployment manifest with proper scaling
+          envsubst < k8s-templates/deployment.yaml.template > k8s-manifests/deployment.yaml
+          envsubst < k8s-templates/service.yaml.template > k8s-manifests/service.yaml
+          envsubst < k8s-templates/hpa.yaml.template > k8s-manifests/hpa.yaml
+          
+      - name: Deploy to Staging
         run: |
-          eksctl create nodegroup --cluster ml-cluster --name spot-nodes --instance-types=m5.large --spot
+          kubectl apply -f k8s-manifests/
+          kubectl rollout status deployment/ml-model-${{ github.sha }} -n ml-staging --timeout=300s
+        
+      - name: Run Integration Tests
+        run: |
+          pip install pytest requests
+          ENDPOINT="https://staging-api.example.com"
+          pytest tests/integration/ --endpoint $ENDPOINT -v
 
-  model_versioning:
-    name: Model Versioning with MLflow
-    needs: deploy
+      # Monitor initial performance in staging
+      - name: Initial Performance Monitoring
+        run: |
+          python src/monitoring/collect_initial_metrics.py \
+            --endpoint https://staging-api.example.com/predict \
+            --duration 300 \
+            --output reports/initial_performance.json
+
+  # ========== PRODUCTION DEPLOYMENT ==========
+  deploy-production:
+    name: Deploy to Production
+    needs: [deploy-staging, train]
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://api.example.com
     steps:
-      - name: Track Model Version in MLflow
-        run: |
-          export MLFLOW_TRACKING_URI=http://mlflow-server:5000
-          mlflow models serve -m "models:/ml_model/latest"
-
-      - name: Store Model in Feature Store
-        run: |
-          pip install feast
-          feast apply
-
-  real_time_monitoring:
-    name: Real-Time Model Performance Monitoring
-    needs: model_versioning
-    runs-on: ubuntu-latest
-    steps:
-      - name: Collect Real-Time Inference Latency
-        run: |
-          python monitoring/collect_latency.py
+      - name: Checkout Code
+        uses: actions/checkout@v3
       
-      - name: Monitor Response Time Trends
+      # Manual approval has already happened through environment protection rules
+      - name: Setup Kubernetes Tools
+        uses: azure/setup-kubectl@v3
+        
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+          
+      - name: Connect to EKS Cluster
         run: |
-          python monitoring/track_response_time.py
-      
-      - name: Alert on High Latency
+          aws eks update-kubeconfig --name production-ml-cluster --region ${{ vars.AWS_REGION }}
+          
+      - name: Generate Kubernetes Manifests
         run: |
-          python monitoring/alert_latency.py
-      
-      - name: Log Inference Performance Metrics
+          mkdir -p k8s-manifests
+          # Use model performance to set resource allocation
+          MODEL_PERFORMANCE="${{ needs.train.outputs.model_performance }}"
+          MODEL_URI="${{ needs.train.outputs.model_uri }}"
+          
+          # Record deployment metadata
+          echo "{\"model_uri\": \"$MODEL_URI\", \"deployed_at\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\"}" > deployment_metadata.json
+          
+          # Generate manifests with canary strategy
+          envsubst < k8s-templates/canary-deployment.yaml.template > k8s-manifests/deployment.yaml
+          envsubst < k8s-templates/service.yaml.template > k8s-manifests/service.yaml
+          envsubst < k8s-templates/hpa.yaml.template > k8s-manifests/hpa.yaml
+          
+      - name: Deploy Canary (10% traffic)
         run: |
-          python monitoring/log_performance_metrics.py
+          kubectl apply -f k8s-manifests/
+          kubectl rollout status deployment/ml-model-canary-${{ github.sha }} -n ml-production --timeout=300s
 
-  security_scan:
-    name: Security Scanning
+      - name: Monitor Canary Performance
+        run: |
+          python src/monitoring/monitor_canary.py \
+            --canary-version ${{ github.sha }} \
+            --baseline-version $(kubectl get deployment -n ml-production -l app=ml-model,version!=canary -o jsonpath='{.items[0].metadata.labels.version}') \
+            --duration 600 \
+            --threshold 0.95 \
+            --output reports/canary_metrics.json
+          
+          # Check if canary metrics are acceptable
+          if [ $? -ne 0 ]; then
+            kubectl rollout undo deployment/ml-model-canary-${{ github.sha }} -n ml-production
+            exit 1
+          fi
+
+      - name: Deploy Full Production
+        run: |
+          # Update manifest for full deployment
+          envsubst < k8s-templates/production-deployment.yaml.template > k8s-manifests/deployment.yaml
+          
+          # Apply full deployment
+          kubectl apply -f k8s-manifests/
+          kubectl rollout status deployment/ml-model-${{ github.sha }} -n ml-production --timeout=300s
+          
+          # Remove canary after full deployment is successful
+          kubectl delete deployment ml-model-canary-${{ github.sha }} -n ml-production
+
+      - name: Register Production Deployment
+        run: |
+          # Register deployment with MLflow
+          python src/deployment/register_deployment.py \
+            --model-uri ${{ needs.train.outputs.model_uri }} \
+            --environment production \
+            --deployment-id ${{ github.sha }} \
+            --metadata-path deployment_metadata.json
+
+  # ========== MONITORING SETUP ==========
+  setup-monitoring:
+    name: Configure Model Monitoring
+    needs: [deploy-production]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v2
-      
-      - name: Run Trivy Security Scan
-        uses: aquasecurity/trivy-action@master
+        uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
         with:
-          scan-type: "fs"
-          exit-code: "1"
-          format: "table"
+          python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Run Snyk Code Security Scan
-        uses: snyk/actions/python@master
-        with:
-          args: "--severity-threshold=high"
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      - name: Configure Prometheus Alerts
+        run: |
+          python src/monitoring/configure_alerts.py \
+            --model-version ${{ env.MODEL_VERSION }} \
+            --alert-webhook ${{ secrets.ALERT_WEBHOOK }}
 
-  monitor:
-    needs: model_versioning
+      - name: Setup Drift Detection
+        run: |
+          python src/monitoring/setup_drift_detection.py \
+            --reference-data data/validation_data.csv \
+            --model-version ${{ env.MODEL_VERSION }} \
+            --threshold 0.05
+
+      - name: Configure Performance Dashboards
+        run: |
+          python src/monitoring/setup_grafana_dashboards.py \
+            --model-version ${{ env.MODEL_VERSION }} \
+            --grafana-api-key ${{ secrets.GRAFANA_API_KEY }}
+            
+      - name: Setup Automatic Retraining Trigger
+        run: |
+          python src/monitoring/setup_retraining_trigger.py \
+            --drift-threshold 0.1 \
+            --performance-threshold 0.9 \
+            --model-version ${{ env.MODEL_VERSION }}
+
+  # ========== BACKUP & DISASTER RECOVERY ==========
+  disaster-recovery:
+    name: Backup & Disaster Recovery
+    needs: [deploy-production]
     runs-on: ubuntu-latest
     steps:
-      - name: Monitor Model Performance
+      - name: Backup Model Artifacts
         run: |
-          python monitoring/model_monitoring.sh
+          aws s3 sync models/ s3://ml-backup-${{ github.repository_owner }}/models/${{ env.MODEL_VERSION }}/
+          aws s3 cp ${{ env.METADATA_PATH }} s3://ml-backup-${{ github.repository_owner }}/metadata/${{ env.MODEL_VERSION }}/
+          
+      - name: Test Failover Capability
+        run: |
+          # Test that failover model can be loaded
+          python src/disaster_recovery/test_failover.py \
+            --model-uri ${{ needs.train.outputs.model_uri }} \
+            --timeout 30
 
-      - name: Detect Model Drift
+      - name: Register Recovery Procedure
         run: |
-          python retraining/drift_detection.py
-
-  a_b_testing:
-    name: Automated A/B Testing & Canary Deployments
-    needs: deploy
-    runs-on: ubuntu-latest
-    steps:
-      - name: Split Traffic for A/B Testing
-        run: |
-          kubectl apply -f kubernetes/traffic-split.yaml
-      
-      - name: Monitor A/B Test Performance
-        run: |
-          python monitoring/ab_test_monitor.py
-      
-      - name: Gradual Rollout with Canary Deployment
-        run: |
-          kubectl apply -f kubernetes/canary-deployment.yaml
-      
-      - name: Validate Canary Performance
-        run: |
-          python monitoring/canary_performance_check.py
-
-    compliance_governance:
-      name: Compliance & Governance Controls
-      needs: disaster_recovery
-      runs-on: ubuntu-latest
-      steps:
-        - name: Enable Audit Logging
-          run: |
-            kubectl apply -f kubernetes/audit-logging.yaml
-        
-        - name: Validate GDPR & SOC 2 Readiness
-          run: |
-            python compliance/gdpr_check.py
-            python compliance/soc2_check.py
-        
-        - name: Enforce Model Access Controls
-          run: |
-            kubectl apply -f kubernetes/rbac-model-access.yaml
-        
-        - name: Log Compliance Events
-          run: |
-            python compliance/log_compliance_events.py
-
-    multi_cloud_deployment:
-      name: Multi-Cloud Deployment Support
-      needs: compliance_governance
-      runs-on: ubuntu-latest
-      steps:
-        - name: Deploy Model on AWS SageMaker
-          run: |
-            bash deployment/deploy_sagemaker.sh
-        
-        - name: Deploy Model on Azure ML
-          run: |
-            bash deployment/deploy_azure_ml.sh
-        
-        - name: Deploy Model on GCP Vertex AI
-          run: |
-            bash deployment/deploy_vertex_ai.sh
-        
-        - name: Validate Multi-Cloud Health
-          run: |
-            python monitoring/multi_cloud_health_check.py
-
-    edge_ai_iot:
-      name: Edge AI & IoT Deployment
-      needs: multi_cloud_deployment
-      runs-on: ubuntu-latest
-      steps:
-        - name: Convert Model to ONNX for Edge Deployment
-          run: |
-            python edge_ai/convert_to_onnx.py
-        
-        - name: Optimize Model with TensorRT
-          run: |
-            python edge_ai/optimize_tensorrt.py
-        
-        - name: Deploy Model to Edge Device
-          run: |
-            python edge_ai/deploy_edge_device.py
-        
-        - name: Monitor Edge AI Performance
-          run: |
-            python monitoring/edge_performance_monitor.py
-
-    federated_learning:
-      name: Federated Learning Support
-      needs: edge_ai_iot
-      runs-on: ubuntu-latest
-      steps:
-        - name: Initialize Federated Learning Clients
-          run: |
-            python federated_learning/init_clients.py
-        
-        - name: Train Model Across Distributed Clients
-          run: |
-            python federated_learning/train_federated.py
-        
-        - name: Aggregate Federated Model Updates
-          run: |
-            python federated_learning/aggregate_updates.py
-        
-        - name: Deploy Federated Model Globally
-          run: |
-            python federated_learning/deploy_federated_model.py
-
-    privacy_preserving_ai:
-      name: Privacy-Preserving AI Techniques
-      needs: federated_learning
-      runs-on: ubuntu-latest
-      steps:
-        - name: Apply Differential Privacy to Model Training
-          run: |
-            python privacy/differential_privacy_train.py
-        
-        - name: Encrypt Model with Homomorphic Encryption
-          run: |
-            python privacy/homomorphic_encrypt_model.py
-        
-        - name: Secure Model Inference with Encrypted Computation
-          run: |
-            python privacy/secure_inference.py
-
-
-  disaster_recovery:
-    name: Disaster Recovery & Failover Strategy
-    needs: a_b_testing
-    runs-on: ubuntu-latest
-    steps:
-      - name: Backup Model & Data
-        run: |
-          aws s3 sync models/ s3://ml-backup-bucket/models/
-          aws s3 sync data/ s3://ml-backup-bucket/data/
-      
-      - name: Deploy Failover Model
-        run: |
-          kubectl apply -f kubernetes/failover-deployment.yaml
-      
-      - name: Test Failover Readiness
-        run: |
-          python monitoring/failover_readiness_check.py
-      
-      - name: Automate Failover Switch if Needed
-        run: |
-          python monitoring/trigger_failover.py
-
-  logging:
-    needs: deploy
-    runs-on: ubuntu-latest
-    steps:
-      - name: Configure Cloud Logging
-        run: |
-          aws logs create-log-group --log-group-name /aws/ml_model_logs || true
-          aws logs create-log-stream --log-group-name /aws/ml_model_logs --log-stream-name inference_logs || true
-          echo "Cloud Logging Configured"
-
-      - name: Send Logs to AWS CloudWatch
-        run: |
-          tail -n 100 logs/model_logs.log | aws logs put-log-events --log-group-name /aws/ml_model_logs --log-stream-name inference_logs --log-events '[{"timestamp": '$(date +%s000)', "message": "Model log data"}]'
-
-      - name: Integrate with Loki Logging
-        run: |
-          curl -X POST -H "Content-Type: application/json" -d '{"streams": [{"stream": {"job": "ml_model"}, "values": [["$(date +%s%N)", "Model log data"]]}]}' http://loki:3100/loki/api/v1/push
-
-  rollback:
-    needs: monitor
-    runs-on: ubuntu-latest
-    if: failure()
-    steps:
-      - name: Rollback to Previous Model Version
-        run: |
-          python rollback/rollback_model.py
+          # Generate recovery runbook
+          python src/disaster_recovery/generate_recovery_plan.py \
+            --model-version ${{ env.MODEL_VERSION }} \
+            --output recovery_plan.md \
+            --s3-backup s3://ml-backup-${{ github.repository_owner }}/models/${{ env.MODEL_VERSION }}/
+            
+          # Upload recovery procedure to documentation system
+          aws s3 cp recovery_plan.md s3://ml-docs-${{ github.repository_owner }}/recovery/${{ env.MODEL_VERSION }}/

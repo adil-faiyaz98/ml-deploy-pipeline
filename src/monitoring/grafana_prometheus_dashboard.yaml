@@ -1,0 +1,9 @@
+# monitoring/grafana_prometheus_dashboard.yaml
+apiVersion: 1
+providers:
+  - name: 'ML Observability'
+    orgId: 1
+    folder: 'Machine Learning'
+    type: file
+    options:
+      path: '/etc/grafana/provisioning/dashboards'

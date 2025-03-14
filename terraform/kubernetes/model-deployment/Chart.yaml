@@ -1,0 +1,9 @@
+apiVersion: v2
+name: model-deployment
+description: A Helm chart for deploying ML models across multiple clouds
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+maintainers:
+  - name: ML Ops Team
+    email: mlops@example.com

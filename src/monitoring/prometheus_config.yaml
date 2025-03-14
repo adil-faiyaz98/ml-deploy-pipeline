@@ -1,0 +1,5 @@
+# monitoring/prometheus_config.yaml
+scrape_configs:
+  - job_name: 'ml_model'
+    static_configs:
+      - targets: ['localhost:9090']

@@ -1,0 +1,48 @@
+# Project information
+project_name = "ml-deploy"
+environment  = "staging"
+aws_region   = "us-west-2"
+owner        = "data-science-team"
+cost_center  = "ml-ops"
+
+# Cluster configuration
+kubernetes_version = "1.28"
+
+# Node configuration
+min_nodes     = 2
+max_nodes     = 10
+desired_nodes = 3
+
+# Database configuration
+db_instance_type = "db.t3.large"  # Use db.r5.large or higher for production
+
+# Redis configuration
+redis_node_type = "cache.t3.medium"  # Use cache.m5.large or higher for production
+
+# Security configuration
+management_ips = [
+  "10.0.0.0/16",  # VPN CIDR
+  "203.0.113.0/24" # Office CIDR
+]
+
+# IAM users with cluster access
+aws_auth_users = [
+  {
+    userarn  = "arn:aws:iam::123456789012:user/admin-user"
+    username = "admin"
+    groups   = ["system:masters"]
+  },
+  {
+    userarn  = "arn:aws:iam::123456789012:user/developer"
+    username = "developer"
+    groups   = ["developer"]
+  }
+]
+
+# Service deployment flags
+deploy_mlflow        = true
+deploy_monitoring    = true
+deploy_elastic_stack = true
+
+# Monitoring configuration
+grafana_admin_password = "change-me-immediately!"
