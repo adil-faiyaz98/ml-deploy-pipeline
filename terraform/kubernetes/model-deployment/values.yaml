@@ -6,6 +6,7 @@ global:
   images:
     pullPolicy: Always
     registry: ${CONTAINER_REGISTRY}
+  imagePullSecrets: []
   
   # Cloud provider specific settings
   aws:
@@ -33,6 +34,8 @@ modelApi:
     repository: model-api
     tag: latest
   
+  port: 8000
+  
   service:
     type: ClusterIP
     port: 8000
@@ -43,49 +46,115 @@ modelApi:
       kubernetes.io/ingress.class: nginx
       cert-manager.io/cluster-issuer: letsencrypt-prod
     path: /
-    host: api.${domain}
+    host: api.${global.domain}
   
   resources:
     limits:
       cpu: 2
       memory: 4Gi
     requests:
-      cpu: 1
-      memory: 2Gi
+      cpu: 500m
+      memory: 1Gi
   
   autoscaling:
     enabled: true
     minReplicas: 2
     maxReplicas: 10
     targetCPUUtilizationPercentage: 80
+    targetMemoryUtilizationPercentage: 80
   
-  # Persistent storage for models
-  persistence:
-    enabled: true
-    accessMode: ReadWriteMany
-    size: 10Gi
+  nodeSelector: {}
   
-  # Security settings
+  tolerations: []
+  
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+            - key: app.kubernetes.io/name
+              operator: In
+              values:
+              - model-api
+          topologyKey: kubernetes.io/hostname
+  
   securityContext:
+    capabilities:
+      drop:
+      - ALL
+    readOnlyRootFilesystem: true
+    allowPrivilegeEscalation: false
     runAsNonRoot: true
     runAsUser: 1000
   
-  # Monitoring settings
-  monitoring:
+  livenessProbe:
+    httpGet:
+      path: /health
+      port: http
+    initialDelaySeconds: 30
+    periodSeconds: 15
+  
+  readinessProbe:
+    httpGet:
+      path: /health
+      port: http
+    initialDelaySeconds: 15
+    periodSeconds: 10
+  
+  env:
+    - name: MODEL_DIR
+      value: "/models"
+    - name: LOG_LEVEL
+      value: "INFO"
+    - name: ENABLE_METRICS
+      value: "true"
+  
+  envFrom:
+    - configMapRef:
+        name: model-api-config
+    - secretRef:
+        name: model-api-secrets
+  
+  persistence:
     enabled: true
-    scrape: true
-    path: /metrics
-    port: 8000
+    mountPath: /models
+    storageClass: "${global.aws.storageClass}"
+    accessMode: ReadWriteOnce
+    size: 10Gi
+  
+  config:
+    mountPath: /app/config
+    files:
+      model_config.json: |
+        {
+          "api": {
+            "host": "0.0.0.0",
+            "port": 8000,
+            "cors_origins": ["*"],
+            "workers": 4
+          },
+          "models": {
+            "dir": "/models",
+            "default_version": "latest",
+            "auto_reload": true,
+            "reload_interval": 60
+          },
+          "logging": {
+            "level": "info",
+            "request_logging": true
+          }
+        }
 
 # MLflow configuration
 mlflow:
   enabled: true
-  name: mlflow
   replicaCount: 1
   
   image:
-    repository: mlflow
-    tag: latest
+    repository: ghcr.io/mlflow/mlflow
+    tag: v2.7.1
   
   service:
     type: ClusterIP
@@ -107,24 +176,68 @@ mlflow:
       cpu: 500m
       memory: 1Gi
   
-  # Database connection
-  database:
-    type: postgres
-    host: ${DB_HOST}
-    port: 5432
-    name: mlflow
-    user: mlflow
+  persistence:
+    enabled: true
+    storageClass: "${storageClass}"
+    size: 10Gi
   
-  # Artifact storage
+  env:
+    - name: MLFLOW_S3_ENDPOINT_URL
+      value: "http://minio.default.svc.cluster.local:9000"
+  
+  backendStore:
+    postgres:
+      enabled: true
+      host: "${dbHost}"
+      port: "${dbPort}"
+      database: mlflow
+      user: "${dbUser}"
+      password: "${dbPassword}"
+  
   artifacts:
-    type: s3  # s3, azure-blob, gcs
-    path: mlflow
-    # Cloud provider specific settings filled in via templates
+    type: ${cloudProvider}  # aws, azure, gcp
+    aws:
+      s3Bucket: "${modelArtifactsBucket}"
+      region: "${region}"
+    azure:
+      storageAccount: "${storageAccount}"
+      containerName: "mlflow"
+    gcp:
+      bucket: "${mlflowArtifactsBucket}"
+  
+  backendStore:
+    postgres:
+      host: "${POSTGRES_HOST}"
+      port: 5432
+      database: "mlmodels"
+      user: "${POSTGRES_USER}"
+      password: "${POSTGRES_PASSWORD}"
+      ssl: require
+  
+  artifactRoot:
+    s3:
+      bucket: "${MODEL_BUCKET}"
+      region: "${AWS_REGION}"
+      access_key_id: "${AWS_ACCESS_KEY_ID}"
+      secret_access_key: "${AWS_SECRET_ACCESS_KEY}"
+      path: "artifacts"
+  
+  serviceAccount:
+    create: true
+    annotations:
+      ${IAM_ROLE_ANNOTATION_KEY}: ${IAM_ROLE_ANNOTATION_VALUE}
+  
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
 
-# Model training jobs
-modelTraining:
+# Training job configuration
+training:
   enabled: true
-  schedule: "0 0 * * *"  # Daily at midnight
+  
   image:
     repository: model-trainer
     tag: latest
@@ -133,56 +246,183 @@ modelTraining:
     limits:
       cpu: 4
       memory: 16Gi
+      # Add GPU resources for specific providers
+      nvidia.com/gpu: 1
     requests:
       cpu: 2
       memory: 8Gi
   
-  # Use GPU for training
-  gpu:
-    enabled: false
-    type: nvidia-tesla-t4
-    count: 1
+  schedule: "0 2 * * *"  # Run at 2 AM daily
   
-  # Data sources# filepath: c:\Users\adilm\repositories\Go\ml-deploy-pipeline\terraform\kubernetes\model-deployment\values.yaml
+  persistence:
+    enabled: true
+    storageClass: "${storageClass}"
+    modelStorage:
+      size: 10Gi
+      accessMode: ReadWriteMany
+    dataStorage:
+      size: 100Gi
+      accessMode: ReadOnlyMany
+  
+  env:
+    - name: DATA_DIR
+      value: /data
+    - name: OUTPUT_DIR
+      value: /models
+    - name: MLFLOW_TRACKING_URI
+      value: "http://mlflow.${namespace}.svc.cluster.local:5000"
+    - name: RESOURCE_UTILIZATION
+      value: "0.8"
+    - name: ENABLE_GPU
+      value: "true"
+  
+  nodeSelector:
+    workload-type: ml-training
+  
+  tolerations:
+    - key: "nvidia.com/gpu"
+      operator: "Exists"
+      effect: "NoSchedule"
+  
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+    allowPrivilegeEscalation: false
 
-# Global values for all deployments
-global:
-  environment: dev
-  cloudProvider: aws  # aws, azure, gcp
-  domain: ml-deploy.example.com
-  images:
-    pullPolicy: Always
-    registry: ${CONTAINER_REGISTRY}
-  
-  # Cloud provider specific settings
-  aws:
-    region: us-west-2
-    serviceAccountAnnotation: eks.amazonaws.com/role-arn
-    storageClass: gp2
-  
-  azure:
-    location: eastus
-    serviceAccountAnnotation: azure.workload.identity/client-id
-    storageClass: managed-premium
-  
-  gcp:
-    region: us-central1
-    serviceAccountAnnotation: iam.gke.io/gcp-service-account
-    storageClass: standard
-
-# Model API configuration
-modelApi:
+# Model Training Job configuration
+modelTrainer:
   enabled: true
-  name: model-api
-  replicaCount: 2
+  schedule: "0 2 * * *"  # Daily at 2 AM
   
   image:
-    repository: model-api
+    repository: model-trainer
     tag: latest
   
-  service:
-    type: ClusterIP
-    port: 8000
+  resources:
+    limits:
+      cpu: 8
+      memory: 32Gi
+      # Uncomment for GPU support
+      # nvidia.com/gpu: 1
+    requests:
+      cpu: 4
+      memory: 16Gi
+  
+  persistence:
+    enabled: true
+    storageClass: "${storageClass}"
+    size: 100Gi
+    
+  env:
+    - name: MLFLOW_TRACKING_URI
+      value: "http://mlflow.${namespace}.svc.cluster.local:5000"
+    - name: MODEL_OUTPUT_PATH
+      value: "/models/output"
+    - name: DATA_PATH
+      value: "/data"
+    - name: CONFIG_PATH
+      value: "/config/training_config.json"
+    - name: LOG_LEVEL
+      value: "INFO"
+  
+  nodeSelector:
+    workload-type: "ml-training"
+  
+  tolerations:
+    - key: "workload"
+      operator: "Equal"
+      value: "ml-training"
+      effect: "NoSchedule"
+  
+  serviceAccount:
+    create: true
+    annotations:
+      ${IAM_ROLE_ANNOTATION_KEY}: ${IAM_ROLE_ANNOTATION_VALUE}
+
+# Monitoring configuration
+monitoring:
+  enabled: true
+  
+  prometheus:
+    enabled: true
+    serviceAccount:
+      create: true
+      annotations:
+        ${serviceAccountAnnotationKey}: ${serviceAccountAnnotationValue}
+    
+    server:
+      persistentVolume:
+        size: 50Gi
+        storageClass: "${storageClass}"
+      resources:
+        limits:
+          cpu: 1
+          memory: 2Gi
+        requests:
+          cpu: 500m
+          memory: 1Gi
+    
+    alertmanager:
+      enabled: true
+      config:
+        global:
+          resolve_timeout: 5m
+        route:
+          group_by: ['alertname', 'job']
+          group_wait: 30s
+          group_interval: 5m
+          repeat_interval: 12h
+          receiver: 'slack'
+        receivers:
+          - name: 'slack'
+            slack_configs:
+              - api_url: '${slackWebhookUrl}'
+                channel: '#ml-alerts'
+                send_resolved: true
+  
+  grafana:
+    enabled: true
+    adminPassword: "${grafanaPassword}"
+    persistence:
+      enabled: true
+      storageClass: "${storageClass}"
+      size: 10Gi
+    resources:
+      limits:
+        cpu: 500m
+        memory: 1Gi
+      requests:
+        cpu: 250m
+        memory: 512Mi
+    plugins:
+      - grafana-piechart-panel
+
+  serviceMonitor:
+    enabled: true
+    selector:
+      prometheus: kube-prometheus
+    endpoints:
+      - port: http
+        path: /metrics
+        interval: 15s
+
+# MinIO for local object storage
+minio:
+  enabled: ${minioEnabled}
+  accessKey: "${minioAccessKey}"
+  secretKey: "${minioSecretKey}"
+  persistence:
+    enabled: true
+    storageClass: "${storageClass}"
+    size: 100Gi
+  resources:
+    requests:
+      memory: 1Gi
+      cpu: 250m
+    limits:
+      memory: 2Gi
+      cpu: 500m
   
   ingress:
     enabled: true
@@ -190,104 +430,66 @@ modelApi:
       kubernetes.io/ingress.class: nginx
       cert-manager.io/cluster-issuer: letsencrypt-prod
     path: /
-    host: api.${domain}
+    host: minio.${domain}
+
+
+# Redis configuration for caching and queueing
+redis:
+  enabled: true
+  architecture: standalone
+  auth:
+    enabled: true
+    password: "${REDIS_PASSWORD}"
   
+  master:
+    persistence:
+      enabled: true
+      storageClass: "${storageClass}"
+      size: 8Gi
+    
+    resources:
+      limits:
+        cpu: 1
+        memory: 2Gi
+      requests:
+        cpu: 500m
+        memory: 1Gi
+  
+  metrics:
+    enabled: true
+    serviceMonitor:
+      enabled: true
+
+# ELK Stack for logging
+elasticsearch:
+  enabled: ${elkEnabled}
+  replicas: 3
+  esJavaOpts: "-Xmx1g -Xms1g"
   resources:
+    requests:
+      cpu: 1
+      memory: 2Gi
     limits:
       cpu: 2
       memory: 4Gi
-    requests:
-      cpu: 1
-      memory: 2Gi
-  
-  autoscaling:
-    enabled: true
-    minReplicas: 2
-    maxReplicas: 10
-    targetCPUUtilizationPercentage: 80
-  
-  # Persistent storage for models
   persistence:
     enabled: true
-    accessMode: ReadWriteMany
-    size: 10Gi
-  
-  # Security settings
-  securityContext:
-    runAsNonRoot: true
-    runAsUser: 1000
-  
-  # Monitoring settings
-  monitoring:
-    enabled: true
-    scrape: true
-    path: /metrics
-    port: 8000
+    storageClass: "${storageClass}"
+    size: 100Gi
 
-# MLflow configuration
-mlflow:
-  enabled: true
-  name: mlflow
-  replicaCount: 1
-  
-  image:
-    repository: mlflow
-    tag: latest
-  
-  service:
-    type: ClusterIP
-    port: 5000
-  
+kibana:
+  enabled: ${elkEnabled}
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: 500m
+      memory: 1Gi
   ingress:
     enabled: true
     annotations:
       kubernetes.io/ingress.class: nginx
       cert-manager.io/cluster-issuer: letsencrypt-prod
     path: /
-    host: mlflow.${domain}
-  
-  resources:
-    limits:
-      cpu: 1
-      memory: 2Gi
-    requests:
-      cpu: 500m
-      memory: 1Gi
-  
-  # Database connection
-  database:
-    type: postgres
-    host: ${DB_HOST}
-    port: 5432
-    name: mlflow
-    user: mlflow
-  
-  # Artifact storage
-  artifacts:
-    type: s3  # s3, azure-blob, gcs
-    path: mlflow
-    # Cloud provider specific settings filled in via templates
-
-# Model training jobs
-modelTraining:
-  enabled: true
-  schedule: "0 0 * * *"  # Daily at midnight
-  image:
-    repository: model-trainer
-    tag: latest
-  
-  resources:
-    limits:
-      cpu: 4
-      memory: 16Gi
-    requests:
-      cpu: 2
-      memory: 8Gi
-  
-  # Use GPU for training
-  gpu:
-    enabled: false
-    type: nvidia-tesla-t4
-    count: 1
-  
-  # Data sources
+    host: kibana.${domain}

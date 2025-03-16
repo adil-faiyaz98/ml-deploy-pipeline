@@ -1,0 +1,229 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: model-deploy
+  namespace: ml-deploy
+spec:
+  entrypoint: deploy-model
+  arguments:
+    parameters:
+      - name: model-id
+        description: MLflow model ID
+      - name: model-version
+        description: Model version to deploy
+      - name: deployment-name
+        description: Name for the deployment
+  
+  templates:
+    - name: deploy-model
+      inputs:
+        parameters:
+          - name: model-id
+          - name: model-version
+          - name: deployment-name
+      dag:
+        tasks:
+          - name: fetch-model
+            template: fetch-model
+            arguments:
+              parameters:
+                - name: model-id
+                  value: "{{inputs.parameters.model-id}}"
+                - name: model-version
+                  value: "{{inputs.parameters.model-version}}"
+          
+          - name: validate-model
+            template: validate-model
+            dependencies: [fetch-model]
+            arguments:
+              parameters:
+                - name: model-path
+                  value: "{{tasks.fetch-model.outputs.parameters.model-path}}"
+          
+          - name: deploy-model
+            template: deploy-container
+            dependencies: [validate-model]
+            arguments:
+              parameters:
+                - name: model-path
+                  value: "{{tasks.fetch-model.outputs.parameters.model-path}}"
+                - name: deployment-name
+                  value: "{{inputs.parameters.deployment-name}}"
+                - name: model-version
+                  value: "{{inputs.parameters.model-version}}"
+          
+          - name: run-smoke-tests
+            template: smoke-tests
+            dependencies: [deploy-model]
+            arguments:
+              parameters:
+                - name: deployment-name
+                  value: "{{inputs.parameters.deployment-name}}"
+                - name: service-url
+                  value: "{{tasks.deploy-model.outputs.parameters.service-url}}"
+    
+    # Individual task templates
+    - name: fetch-model
+      inputs:
+        parameters:
+          - name: model-id
+          - name: model-version
+      container:
+        image: mlflow-utils:latest
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            mlflow artifacts download -u $MLFLOW_TRACKING_URI \
+              --run-id {{inputs.parameters.model-id}} \
+              --artifact-path model \
+              --dst-path /models/{{inputs.parameters.model-version}}
+            echo /models/{{inputs.parameters.model-version}} > /tmp/model-path
+        env:
+          - name: MLFLOW_TRACKING_URI
+            value: "http://mlflow.ml-deploy:5000"
+        volumeMounts:
+          - name: models-volume
+            mountPath: /models
+      outputs:
+        parameters:
+          - name: model-path
+            valueFrom:
+              path: /tmp/model-path
+    
+    - name: validate-model
+      inputs:
+        parameters:
+          - name: model-path
+      container:
+        image: model-validator:latest
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            python -m src.validation.validate_model \
+              --model-path {{inputs.parameters.model-path}} \
+              --validation-data /data/validation/latest.csv \
+              --output-path /tmp/validation-results.json
+            
+            # Check validation status
+            result=$(cat /tmp/validation-results.json | jq -r '.passed')
+            if [ "$result" != "true" ]; then
+              echo "Model validation failed"
+              exit 1
+            fi
+        volumeMounts:
+          - name: models-volume
+            mountPath: /models
+          - name: data-volume
+            mountPath: /data
+            readOnly: true
+    
+    - name: deploy-container
+      inputs:
+        parameters:
+          - name: model-path
+          - name: deployment-name
+          - name: model-version
+      container:
+        image: kubectl:latest
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            # Create kubernetes deployment with appropriate labels and annotations
+            cat > /tmp/deployment.yaml <<EOF
+            apiVersion: apps/v1
+            kind: Deployment
+            metadata:
+              name: {{inputs.parameters.deployment-name}}
+              namespace: ml-deploy
+              labels:
+                app: model-api
+                version: {{inputs.parameters.model-version}}
+            spec:
+              replicas: 2
+              selector:
+                matchLabels:
+                  app: model-api
+                  version: {{inputs.parameters.model-version}}
+              template:
+                metadata:
+                  labels:
+                    app: model-api
+                    version: {{inputs.parameters.model-version}}
+                  annotations:
+                    model.ml-deploy.io/id: {{inputs.parameters.model-id}}
+                    model.ml-deploy.io/version: {{inputs.parameters.model-version}}
+                spec:
+                  containers:
+                  - name: model-api
+                    image: model-api:latest
+                    env:
+                    - name: MODEL_PATH
+                      value: {{inputs.parameters.model-path}}
+                    - name: MODEL_VERSION
+                      value: {{inputs.parameters.model-version}}
+                    ports:
+                    - containerPort: 8000
+                    resources:
+                      requests:
+                        cpu: 500m
+                        memory: 1Gi
+                      limits:
+                        cpu: 1
+                        memory: 2Gi
+            EOF
+            
+            # Apply the deployment
+            kubectl apply -f /tmp/deployment.yaml
+            
+            # Create service if it doesn't exist
+            kubectl get service {{inputs.parameters.deployment-name}} -n ml-deploy || \
+            kubectl create service clusterip {{inputs.parameters.deployment-name}} \
+              --tcp=8000:8000 -n ml-deploy \
+              --labels="app=model-api,version={{inputs.parameters.model-version}}"
+            
+            # Wait for deployment to be available
+            kubectl rollout status deployment/{{inputs.parameters.deployment-name}} \
+              -n ml-deploy --timeout=300s
+              
+            echo "http://{{inputs.parameters.deployment-name}}.ml-deploy:8000" > /tmp/service-url
+      outputs:
+        parameters:
+          - name: service-url
+            valueFrom:
+              path: /tmp/service-url
+    
+    - name: smoke-tests
+      inputs:
+        parameters:
+          - name: service-url
+          - name: deployment-name
+      container:
+        image: model-test:latest
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            # Run smoke tests against the new deployment
+            python -m src.tests.smoke_test \
+              --service-url {{inputs.parameters.service-url}} \
+              --test-data /data/smoke-test/samples.json \
+              --output-path /tmp/smoke-test-results.json
+            
+            # Check test results
+            result=$(cat /tmp/smoke-test-results.json | jq -r '.passed')
+            if [ "$result" != "true" ]; then
+              echo "Smoke tests failed for {{inputs.parameters.deployment-name}}"
+              exit 1
+            fi
+        volumeMounts:
+          - name: data-volume
+            mountPath: /data
+            readOnly: true
+
+  # Workflow volumes
+  volumes:
+    - name: models-volume
+      persistentVolumeClaim:
+        claimName: models-pvc
+    - name: data-volume
+      persistentVolumeClaim:
+        claimName: validation-data-pvc

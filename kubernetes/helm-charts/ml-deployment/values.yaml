@@ -1,0 +1,229 @@
+# Global values for all deployments
+global:
+  environment: dev  # dev, staging, production
+  cloudProvider: aws  # aws, azure, gcp
+  domain: ml-deploy.example.com
+  images:
+    registry: ${REGISTRY_URL}
+    pullPolicy: Always
+  imagePullSecrets: []
+  
+  # Storage configuration
+  storage:
+    models:
+      size: 10Gi
+    data:
+      size: 50Gi
+    
+  # Cloud provider specific settings
+  aws:
+    region: us-west-2
+    serviceAccountAnnotation: eks.amazonaws.com/role-arn
+    storageClass: gp2
+  
+  azure:
+    location: eastus
+    serviceAccountAnnotation: azure.workload.identity/client-id
+    storageClass: managed-premium
+  
+  gcp:
+    region: us-central1
+    serviceAccountAnnotation: iam.gke.io/gcp-service-account
+    storageClass: standard
+
+# Model API configuration
+modelApi:
+  enabled: true
+  name: model-api
+  replicaCount: 2
+  
+  image:
+    repository: model-api
+    tag: latest
+  
+  port: 8000
+  
+  service:
+    type: ClusterIP
+    port: 8000
+  
+  ingress:
+    enabled: true
+    annotations:
+      kubernetes.io/ingress.class: nginx
+      cert-manager.io/cluster-issuer: letsencrypt-prod
+    path: /
+    host: api.${global.domain}
+  
+  resources:
+    limits:
+      cpu: 2
+      memory: 4Gi
+    requests:
+      cpu: 1
+      memory: 2Gi
+      
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 80
+    targetMemoryUtilizationPercentage: 80
+  
+  livenessProbe:
+    initialDelaySeconds: 60
+    periodSeconds: 30
+    timeoutSeconds: 10
+  
+  readinessProbe:
+    initialDelaySeconds: 30
+    periodSeconds: 10
+    timeoutSeconds: 5
+  
+  nodeSelector: {}
+  tolerations: []
+  affinity:
+    nodeAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        preference:
+          matchExpressions:
+          - key: workload-type
+            operator: In
+            values:
+            - model-serving
+  
+  persistence:
+    enabled: true
+    storageClass: ""  # Use cloud provider default
+    accessMode: ReadWriteMany
+    size: 10Gi
+  
+  configMap:
+    enabled: true
+    mountPath: /app/config
+    data:
+      model_config.json: |
+        {
+          "api": {
+            "host": "0.0.0.0",
+            "port": 8000,
+            "workers": 4
+          },
+          "models": {
+            "dir": "/models",
+            "default_version": "latest",
+            "auto_reload": true,
+            "reload_interval": 60
+          },
+          "logging": {
+            "level": "info",
+            "request_logging": true
+          }
+        }
+
+# MLflow configuration
+mlflow:
+  enabled: true
+  replicaCount: 1
+  
+  image:
+    repository: ghcr.io/mlflow/mlflow
+    tag: v2.7.1
+  
+  service:
+    type: ClusterIP
+    port: 5000
+  
+  ingress:
+    enabled: true
+    annotations:
+      kubernetes.io/ingress.class: nginx
+      cert-manager.io/cluster-issuer: letsencrypt-prod
+    path: /
+    host: mlflow.${global.domain}
+  
+  resources:
+    limits:
+      cpu: 1
+      memory: 2Gi
+    requests:
+      cpu: 500m
+      memory: 1Gi
+  
+  persistence:
+    enabled: true
+    size: 10Gi
+  
+  env:
+    - name: MLFLOW_S3_ENDPOINT_URL
+      value: "http://minio.default.svc.cluster.local:9000"
+  
+  backendStore:
+    postgres:
+      enabled: true
+      host: "${DB_HOST}"
+      port: "${DB_PORT}"
+      database: "mlflow"
+      user: "${DB_USER}"
+      passwordSecret: "mlflow-db-secrets"
+      passwordSecretKey: "password"
+  
+  artifactRoot:
+    s3:
+      enabled: true
+      bucket: "${MODEL_ARTIFACTS_BUCKET}"
+      path: "mlflow"
+
+# Model training job configuration
+modelTrainer:
+  enabled: true
+  schedule: "0 2 * * *"  # Daily at 2 AM
+  
+  image:
+    repository: model-trainer
+    tag: latest
+  
+  resources:
+    limits:
+      cpu: 4
+      memory: 16Gi
+      # Uncomment for GPU training
+      # nvidia.com/gpu: 1
+    requests:
+      cpu: 2
+      memory: 8Gi
+  
+  env:
+    - name: MLFLOW_TRACKING_URI
+      value: "http://mlflow-service:5000"
+    - name: DATA_DIR
+      value: "/data"
+    - name: OUTPUT_DIR
+      value: "/models"
+  
+  volumes:
+    - name: data-volume
+      persistentVolumeClaim:
+        claimName: training-data
+    - name: models-volume
+      persistentVolumeClaim:
+        claimName: model-storage
+  
+  volumeMounts:
+    - name: data-volume
+      mountPath: /data
+    - name: models-volume
+      mountPath: /models
+  
+  nodeSelector: {}
+  tolerations: []
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: workload-type
+            operator: In
+            values:
+            - ml-training

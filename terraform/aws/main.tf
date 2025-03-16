@@ -1,14 +1,84 @@
 # ------------------------------------------------------------------------------
-# AWS INFRASTRUCTURE
+# AWS IMPLEMENTATION
 # ------------------------------------------------------------------------------
+
+provider "aws" {
+  region = var.region
+  
+  default_tags {
+    tags = {
+      Project     = var.project_name
+      Environment = var.environment
+      Terraform   = "true"
+      Owner       = var.owner
+      CostCenter  = var.cost_center
+    }
+  }
+}
 
 locals {
   name_prefix = "${var.project_name}-${var.environment}"
   
+  vpc_cidr = var.vpc_cidr
+  
+  azs             = slice(data.aws_availability_zones.available.names, 0, 3)
+  
+  private_subnets = [
+    cidrsubnet(local.vpc_cidr, 4, 0),
+    cidrsubnet(local.vpc_cidr, 4, 1),
+    cidrsubnet(local.vpc_cidr, 4, 2)
+  ]
+  
+  public_subnets = [
+    cidrsubnet(local.vpc_cidr, 8, 0),
+    cidrsubnet(local.vpc_cidr, 8, 1),
+    cidrsubnet(local.vpc_cidr, 8, 2)
+  ]
+  
+  database_subnets = [
+    cidrsubnet(local.vpc_cidr, 8, 100),
+    cidrsubnet(local.vpc_cidr, 8, 101),
+    cidrsubnet(local.vpc_cidr, 8, 102)
+  ]
+  
+  elasticache_subnets = [
+    cidrsubnet(local.vpc_cidr, 8, 200),
+    cidrsubnet(local.vpc_cidr, 8, 201),
+    cidrsubnet(local.vpc_cidr, 8, 202)
+  ]
+  
+  # Instance type mappings based on node size
+  instance_types = {
+    "small"  = "t3.medium"
+    "medium" = "m5.large" 
+    "large"  = "m5.2xlarge"
+    "xlarge" = "m5.4xlarge"
+    "gpu-small" = "g4dn.xlarge"
+    "gpu-medium" = "g4dn.2xlarge"
+    "gpu-large" = "g4dn.4xlarge"
+  }
+  
+  # RDS instance type mappings
+  db_instance_types = {
+    "small"  = "db.t3.medium"
+    "medium" = "db.m5.large"
+    "large"  = "db.m5.xlarge"
+    "xlarge" = "db.m5.2xlarge"
+  }
+  
+  # ElastiCache instance type mappings
+  redis_node_types = {
+    "small"  = "cache.t3.medium"
+    "medium" = "cache.m5.large"
+    "large"  = "cache.m5.xlarge"
+    "xlarge" = "cache.m5.2xlarge"
+  }
+  
+  # EKS managed node groups configuration
   eks_managed_node_groups = {
     ml_compute = {
       name           = "ml-compute"
-      instance_types = ["m5.2xlarge", "m5.4xlarge"]
+      instance_types = [local.instance_types["large"]]
       min_size       = var.min_nodes
       max_size       = var.max_nodes
       desired_size   = var.desired_nodes
@@ -39,7 +109,7 @@ locals {
     
     api_serving = {
       name           = "api-serving"
-      instance_types = ["c5.xlarge", "c5.2xlarge"]
+      instance_types = [local.instance_types["medium"]]
       min_size       = 2
       max_size       = 10
       desired_size   = 2
@@ -52,50 +122,20 @@ locals {
       
       taints = []
     },
-  }
-  
-  vpc_cidr = var.vpc_cidr
-  
-  azs             = slice(data.aws_availability_zones.available.names, 0, 3)
-  
-  private_subnets = [
-    cidrsubnet(local.vpc_cidr, 4, 0),
-    cidrsubnet(local.vpc_cidr, 4, 1),
-    cidrsubnet(local.vpc_cidr, 4, 2)
-  ]
-  
-  public_subnets = [
-    cidrsubnet(local.vpc_cidr, 8, 0),
-    cidrsubnet(local.vpc_cidr, 8, 1),
-    cidrsubnet(local.vpc_cidr, 8, 2)
-  ]
-  
-  database_subnets = [
-    cidrsubnet(local.vpc_cidr, 8, 100),
-    cidrsubnet(local.vpc_cidr, 8, 101),
-    cidrsubnet(local.vpc_cidr, 8, 102)
-  ]
-  
-  # Map generic instance types to AWS-specific ones
-  db_instance_type_map = {
-    "small"  = "db.t3.medium",
-    "medium" = "db.r5.large",
-    "large"  = "db.r5.xlarge"
-  }
-  
-  redis_node_type_map = {
-    "small"  = "cache.t3.medium",
-    "medium" = "cache.m5.large",
-    "large"  = "cache.m5.xlarge"
-  }
-  
-  common_tags = {
-    Project     = var.project_name
-    Environment = var.environment
-    Terraform   = "true"
-    Owner       = var.owner
-    CostCenter  = var.cost_center
-    Cloud       = "aws"
+    
+    monitoring = {
+      name           = "monitoring"
+      instance_types = [local.instance_types["small"]]
+      min_size       = 1
+      max_size       = 3
+      desired_size   = 1
+      
+      capacity_type  = "ON_DEMAND"
+      
+      labels = {
+        workload-type = "monitoring"
+      }
+    }
   }
 }
 
@@ -122,9 +162,11 @@ module "vpc" {
   private_subnets  = local.private_subnets
   public_subnets   = local.public_subnets
   database_subnets = local.database_subnets
+  elasticache_subnets = local.elasticache_subnets
   
   create_database_subnet_group       = true
   create_database_subnet_route_table = true
+  create_elasticache_subnet_group    = true
   
   enable_nat_gateway     = true
   single_nat_gateway     = var.environment != "production"
@@ -140,7 +182,11 @@ module "vpc" {
   create_flow_log_cloudwatch_iam_role  = true
   flow_log_max_aggregation_interval    = 60
   
-  tags = local.common_tags
+  # Network security
+  manage_default_security_group = true
+  
+  default_security_group_ingress = []
+  default_security_group_egress  = []
 }
 
 # ------------------------------------------------------------------------------
@@ -184,6 +230,25 @@ module "eks" {
     }
   }
   
+  node_security_group_additional_rules = {
+    ingress_self_all = {
+      description = "Allow nodes to communicate with each other"
+      protocol    = "-1"
+      from_port   = 0
+      to_port     = 0
+      type        = "ingress"
+      self        = true
+    }
+    egress_all = {
+      description = "Allow nodes to communicate to the internet"
+      protocol    = "-1"
+      from_port   = 0
+      to_port     = 0
+      type        = "egress"
+      cidr_blocks = ["0.0.0.0/0"]
+    }
+  }
+  
   # AWS IAM roles for service accounts (IRSA)
   cluster_identity_providers = {
     sts = {
@@ -191,17 +256,9 @@ module "eks" {
     }
   }
   
-  tags = local.common_tags
-  
   manage_aws_auth_configmap = true
-  aws_auth_roles = concat(
-    var.eks_admin_roles,
-    [{
-      rolearn  = module.eks_admin_iam_role.iam_role_arn
-      username = "admin"
-      groups   = ["system:masters"]
-    }]
-  )
+  
+  aws_auth_roles = var.eks_admin_roles
 }
 
 # ------------------------------------------------------------------------------
@@ -211,16 +268,18 @@ resource "aws_kms_key" "eks" {
   description             = "EKS Cluster Encryption Key"
   deletion_window_in_days = 7
   enable_key_rotation     = true
-  
-  tags = local.common_tags
 }
 
 resource "aws_kms_key" "rds" {
   description             = "RDS Encryption Key"
   deletion_window_in_days = 7
   enable_key_rotation     = true
-  
-  tags = local.common_tags
+}
+
+resource "aws_kms_key" "s3" {
+  description             = "S3 Encryption Key for ML artifacts"
+  deletion_window_in_days = 7
+  enable_key_rotation     = true
 }
 
 # ------------------------------------------------------------------------------
@@ -236,7 +295,7 @@ module "db" {
   engine_version       = "14.7"
   family               = "postgres14"
   major_engine_version = "14"
-  instance_class       = lookup(local.db_instance_type_map, var.db_instance_type, local.db_instance_type_map["small"])
+  instance_class       = local.db_instance_types[var.db_instance_type]
   
   allocated_storage     = 100
   max_allocated_storage = 500
@@ -261,29 +320,69 @@ module "db" {
   monitoring_role_name          = "${local.name_prefix}-rds-monitoring-role"
   create_monitoring_role        = true
   enabled_cloudwatch_logs_exports = ["postgresql", "upgrade"]
-
-  tags = local.common_tags
+  
+  # Backups and snapshots
+  backup_retention_period = var.environment == "production" ? 30 : 7
+  skip_final_snapshot     = var.environment != "production"
+  final_snapshot_identifier = var.environment == "production" ? "${local.name_prefix}-db-final-snapshot" : null
+  
+  # Encryption
+  storage_encrypted      = true
+  kms_key_id             = aws_kms_key.rds.arn
+  performance_insights_enabled = true
+  
+  # Upgrades
+  auto_minor_version_upgrade = true
+  apply_immediately          = var.environment != "production"
+  
+  # Parameters
+  parameters = [
+    {
+      name  = "max_connections"
+      value = "500"
+    },
+    {
+      name  = "shared_buffers"
+      value = "4096MB"
+    },
+    {
+      name  = "work_mem"
+      value = "64MB"
+    }
+  ]
 }
 
 # ------------------------------------------------------------------------------
 # ELASTICACHE REDIS
 # ------------------------------------------------------------------------------
 module "redis" {
-  source  = "cloudposse/elasticache-redis/aws"
+  source = "cloudposse/elasticache-redis/aws"
   version = "~> 0.52"
   
   name                       = "${local.name_prefix}-redis"
   vpc_id                     = module.vpc.vpc_id
-  subnets                    = module.vpc.private_subnets
+  subnets                    = module.vpc.elasticache_subnets
   availability_zones         = local.azs
   allowed_security_group_ids = [aws_security_group.redis_access.id]
   
-  instance_type              = lookup(local.redis_node_type_map, var.redis_node_type, local.redis_node_type_map["small"])
+  instance_type              = local.redis_node_types[var.redis_node_type]
   cluster_mode_enabled       = var.environment == "production"
   cluster_mode_num_node_groups = var.environment == "production" ? 3 : 1
   cluster_mode_replicas_per_node_group = var.environment == "production" ? 1 : 0
   
-  tags = local.common_tags
+  automatic_failover_enabled = var.environment == "production"
+  multi_az_enabled           = var.environment == "production"
+  
+  transit_encryption_enabled = true
+  auth_token                 = random_password.redis_password.result
+  
+  parameter_group_name       = "default.redis7.cluster.on"
+  at_rest_encryption_enabled = true
+  
+  # Maintenance and backups
+  maintenance_window         = "sun:05:00-sun:07:00"
+  snapshot_window            = "03:00-05:00"
+  snapshot_retention_limit   = var.environment == "production" ? 7 : 1
 }
 
 # ------------------------------------------------------------------------------
@@ -313,15 +412,181 @@ module "model_artifacts_bucket" {
     }
   }
   
-  tags = local.common_tags
+  # Access logs
+  logging = {
+    target_bucket = module.log_bucket.s3_bucket_id
+    target_prefix = "model-artifacts-logs/"
+  }
+  
+  # S3 bucket-level Public Access Block
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+  
+  # Object lifecycle
+  lifecycle_rule = [
+    {
+      id      = "archive"
+      enabled = true
+      prefix  = "archived/"
+      
+      transition = [
+        {
+          days          = 30
+          storage_class = "STANDARD_IA"
+        },
+        {
+          days          = 90
+          storage_class = "GLACIER"
+        }
+      ]
+    }
+  ]
 }
 
-resource "aws_kms_key" "s3" {
-  description             = "S3 Encryption Key for ML artifacts"
-  deletion_window_in_days = 7
-  enable_key_rotation     = true
+module "log_bucket" {
+  source  = "terraform-aws-modules/s3-bucket/aws"
+  version = "~> 3.15"
   
-  tags = local.common_tags
+  bucket = "${local.name_prefix}-logs"
+  acl    = "log-delivery-write"
+  
+  force_destroy = var.environment != "production"
+  
+  # Encryption
+  server_side_encryption_configuration = {
+    rule = {
+      apply_server_side_encryption_by_default = {
+        kms_master_key_id = aws_kms_key.s3.arn
+        sse_algorithm     = "aws:kms"
+      }
+    }
+  }
+  
+  # Versioning
+  versioning = {
+    enabled = true
+  }
+  
+  # S3 bucket-level Public Access Block
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+  
+  # Lifecycle rules for log rotation
+  lifecycle_rule = [
+    {
+      id      = "log-expiration"
+      enabled = true
+      
+      expiration = {
+        days = var.environment == "production" ? 365 : 90
+      }
+      
+      noncurrent_version_expiration = {
+        days = 30
+      }
+    }
+  ]
+}
+
+# ------------------------------------------------------------------------------
+# IAM ROLES FOR SERVICE ACCOUNTS (IRSA)
+# ------------------------------------------------------------------------------
+module "model_api_irsa_role" {
+  source = "terraform-aws-modules/iam/aws//modules/iam-role-for-service-accounts-eks"
+  version = "~> 5.30"
+
+  role_name = "${local.name_prefix}-model-api-role"
+  
+  role_policy_arns = {
+    s3_access = aws_iam_policy.model_api_s3_access.arn
+    cloudwatch = aws_iam_policy.model_api_cloudwatch.arn
+    secretsmanager = aws_iam_policy.model_api_secretsmanager.arn
+  }
+  
+  oidc_providers = {
+    main = {
+      provider_arn = module.eks.oidc_provider_arn
+      namespace_service_accounts = ["default:model-api"]
+    }
+  }
+}
+
+resource "aws_iam_policy" "model_api_s3_access" {
+  name        = "${local.name_prefix}-model-api-s3-access"
+  path        = "/"
+  description = "IAM policy for Model API S3 access"
+  
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = [
+          "s3:GetObject",
+          "s3:ListBucket",
+          "s3:PutObject",
+        ]
+        Effect = "Allow"
+        Resource = [
+          module.model_artifacts_bucket.s3_bucket_arn,
+          "${module.model_artifacts_bucket.s3_bucket_arn}/*"
+        ]
+      }
+    ]
+  })
+}
+
+resource "aws_iam_policy" "model_api_cloudwatch" {
+  name        = "${local.name_prefix}-model-api-cloudwatch"
+  path        = "/"
+  description = "IAM policy for Model API CloudWatch access"
+  
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents",
+          "logs:DescribeLogStreams"
+        ]
+        Effect = "Allow"
+        Resource = "arn:aws:logs:*:*:*"
+      },
+      {
+        Action = [
+          "cloudwatch:PutMetricData"
+        ]
+        Effect = "Allow"
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_policy" "model_api_secretsmanager" {
+  name        = "${local.name_prefix}-model-api-secretsmanager"
+  path        = "/"
+  description = "IAM policy for Model API Secrets Manager access"
+  
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = [
+          "secretsmanager:GetSecretValue"
+        ]
+        Effect = "Allow"
+        Resource = [
+          "arn:aws:secretsmanager:${var.region}:${data.aws_caller_identity.current.account_id}:secret:${local.name_prefix}-*"
+        ]
+      }
+    ]
+  })
 }
 
 # ------------------------------------------------------------------------------
@@ -340,14 +605,17 @@ resource "aws_security_group" "database" {
     security_groups = [module.eks.node_security_group_id]
   }
   
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
+  # Allow VPN/management access if needed
+  dynamic "ingress" {
+    for_each = length(var.management_ips) > 0 ? [1] : []
+    content {
+      description = "PostgreSQL from management IPs"
+      from_port   = 5432
+      to_port     = 5432
+      protocol    = "tcp"
+      cidr_blocks = var.management_ips
+    }
   }
-  
-  tags = local.common_tags
 }
 
 resource "aws_security_group" "redis_access" {
@@ -362,58 +630,102 @@ resource "aws_security_group" "redis_access" {
     protocol        = "tcp"
     security_groups = [module.eks.node_security_group_id]
   }
-  
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-  
-  tags = local.common_tags
 }
 
 # ------------------------------------------------------------------------------
-# IAM ROLES
+# SECRET MANAGER FOR CREDENTIALS
 # ------------------------------------------------------------------------------
-module "eks_admin_iam_role" {
-  source  = "terraform-aws-modules/iam/aws//modules/iam-assumable-role"
-  version = "~> 5.30"
+resource "aws_secretsmanager_secret" "model_api_credentials" {
+  name        = "${local.name_prefix}-model-api-credentials"
+  description = "Credentials for Model API"
   
-  create_role = true
-  role_name   = "${local.name_prefix}-eks-admin"
+  recovery_window_in_days = var.environment == "production" ? 30 : 0
+}
+
+resource "aws_secretsmanager_secret_version" "model_api_credentials" {
+  secret_id = aws_secretsmanager_secret.model_api_credentials.id
   
-  trusted_role_arns = [
-    "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"
-  ]
-  
-  custom_role_policy_arns = [
-    "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"
-  ]
-  
-  tags = local.common_tags
+  secret_string = jsonencode({
+    db_host     = module.db.db_instance_address
+    db_port     = module.db.db_instance_port
+    db_name     = module.db.db_instance_name
+    db_username = module.db.db_instance_username
+    db_password = module.db.db_instance_password
+    redis_host  = module.redis.endpoint
+    redis_port  = 6379
+    redis_auth  = random_password.redis_password.result
+  })
 }
 
 # ------------------------------------------------------------------------------
-# MLFLOW HELM VALUES FOR AWS
+# RANDOM PASSWORDS
 # ------------------------------------------------------------------------------
-locals {
-  mlflow_helm_values = [
-    {
-      name  = "backendStore.postgres.host"
-      value = module.db.db_instance_address
-    },
-    {
-      name  = "backendStore.postgres.port"
-      value = module.db.db_instance_port
-    },
-    {
-      name  = "backendStore.postgres.database"
-      value = module.db.db_instance_name
-    },
-    {
-      name  = "backendStore.postgres.user"
-      value = module.db.db_instance_username
-    },
-    {
-      name
+resource "random_password" "redis_password" {
+  length  = 16
+  special = false
+}
+
+# ------------------------------------------------------------------------------
+# OUTPUTS
+# ------------------------------------------------------------------------------
+output "eks_cluster_id" {
+  description = "EKS cluster ID"
+  value       = module.eks.cluster_id
+}
+
+output "eks_cluster_endpoint" {
+  description = "Endpoint for EKS control plane"
+  value       = module.eks.cluster_endpoint
+}
+
+output "eks_cluster_security_group_id" {
+  description = "Security group ID attached to the EKS cluster"
+  value       = module.eks.cluster_security_group_id
+}
+
+output "db_instance_endpoint" {
+  description = "The connection endpoint for the RDS database"
+  value       = module.db.db_instance_endpoint
+  sensitive   = true
+}
+
+output "redis_endpoint" {
+  description = "Redis primary endpoint"
+  value       = module.redis.endpoint
+}
+
+output "model_artifacts_bucket" {
+  description = "S3 bucket for model artifacts"
+  value       = module.model_artifacts_bucket.s3_bucket_id
+}
+
+output "eks_oidc_provider_arn" {
+  description = "ARN of the OIDC Provider for EKS"
+  value       = module.eks.oidc_provider_arn
+}
+
+output "eks_node_groups" {
+  description = "EKS node groups"
+  value       = module.eks.eks_managed_node_groups
+}
+
+output "vpc_id" {
+  description = "VPC ID"
+  value       = module.vpc.vpc_id
+}
+
+output "private_subnets" {
+  description = "Private subnets"
+  value       = module.vpc.private_subnets
+}
+
+output "kubeconfig" {
+  description = "kubeconfig for the cluster"
+  value       = module.eks.kubeconfig
+  sensitive   = true
+}
+
+output "cluster_endpoint" {
+  description = "Endpoint for your Kubernetes API server"
+  value       = module.eks.cluster_endpoint
+}

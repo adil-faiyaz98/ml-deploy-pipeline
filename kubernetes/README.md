@@ -7,10 +7,32 @@ This directory contains Kubernetes manifests and Helm charts for deploying the M
 The ML deployment follows a GitOps approach, separating infrastructure provisioning (Terraform) from application deployment (Kubernetes manifests).
 
 ### Directory Structure
-
+#### Terraform
+```bash
+terraform
+  - aws
+    - main.tf
+  - azure
+    - variables.tf
+  - gcp
+    - main.tf
+    - variables.tf
+  - ci-cd
+  - environments
+    - dev
+    - prod
+  - cloud-selector.tf
+  - main.tf
+  - terraform.tfvars.example
+  - variables-common.tf
+  - variables.tf
+```
+#### Kubernetes
+```bash
 kubernetes
-    - base          --> Base configurations shared across environments 
-    - ml-api        --> ML API Service 
+    - base          
+      - ml-api   
+        - deployment.yaml       
     - mlflow        --> MLFlow experiment tracking
     - monitoring    -->  Prometheus / Grafana 
     - training      --> Model training jobs
@@ -19,6 +41,8 @@ kubernetes
         - staging
         - production
         - helm-charts 
+
+```
 
 ## Deployment Approach
 

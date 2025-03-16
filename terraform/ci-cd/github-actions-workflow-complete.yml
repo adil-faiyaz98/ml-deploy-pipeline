@@ -1,0 +1,496 @@
+name: ML Deploy Pipeline - Complete CI/CD
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'src/**'
+      - 'terraform/**'
+      - 'deployment/**'
+      - 'kubernetes/**'
+      - '.github/workflows/**'
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - production
+      cloud_provider:
+        description: 'Cloud provider to deploy to'
+        required: true
+        default: 'aws'
+        type: choice
+        options:
+          - aws
+          - azure
+          - gcp
+      deploy_infra:
+        description: 'Deploy infrastructure'
+        required: true
+        default: 'false'
+        type: boolean
+      deploy_app:
+        description: 'Deploy application'
+        required: true
+        default: 'true'
+        type: boolean
+
+env:
+  TF_VERSION: '1.5.7'
+  PYTHON_VERSION: '3.10'
+  TF_IN_AUTOMATION: 'true'
+  # AWS environment variables
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  # Azure environment variables
+  ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+  ARM_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+  # GCP environment variables
+  GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+  
+jobs:
+  lint-and-test:
+    name: Lint and Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          pip install -e .
+          
+      - name: Lint with flake8
+        run: |
+          # stop the build if there are Python syntax errors or undefined names
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+          # exit-zero treats all errors as warnings
+          flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+          
+      - name: Run unit tests
+        run: |
+          pytest src/tests/ --cov=src
+          
+      - name: Upload test coverage report
+        uses: codecov/codecov-action@v3
+        with:
+          fail_ci_if_error: false
+          
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          
+      - name: Validate Terraform
+        run: |
+          cd terraform
+          terraform fmt -check -recursive
+          terraform init -backend=false
+          terraform validate
+
+  build:
+    name: Build and Push Container
+    needs: lint-and-test
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.tag.outputs.tag }}
+      environment: ${{ steps.vars.outputs.environment }}
+      cloud_provider: ${{ steps.vars.outputs.cloud_provider }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Generate image tag
+        id: tag
+        run: |
+          # Use Git tag if available, otherwise use commit hash
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            echo "::set-output name=tag::${{ github.ref_name }}"
+          else
+            echo "::set-output name=tag::$(git rev-parse --short HEAD)"
+          fi
+
+      - name: Set environment variables
+        id: vars
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "::set-output name=environment::${{ github.event.inputs.environment }}"
+            echo "::set-output name=cloud_provider::${{ github.event.inputs.cloud_provider }}"
+          else
+            echo "::set-output name=environment::dev"
+            echo "::set-output name=cloud_provider::aws"
+          fi
+          
+          # Set cloud-specific registry URLs based on provider
+          if [ "${{ steps.vars.outputs.cloud_provider }}" == "aws" ]; then
+            echo "::set-output name=registry::${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com"
+          elif [ "${{ steps.vars.outputs.cloud_provider }}" == "azure" ]; then
+            echo "::set-output name=registry::${{ secrets.AZURE_REGISTRY_URL }}"
+          elif [ "${{ steps.vars.outputs.cloud_provider }}" == "gcp" ]; then
+            echo "::set-output name=registry::${{ secrets.GCP_REGISTRY_URL }}"
+          fi
+
+      # AWS ECR Login
+      - name: Configure AWS credentials (AWS)
+        if: ${{ steps.vars.outputs.cloud_provider == 'aws' }}
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          
+      - name: Login to Amazon ECR (AWS)
+        if: ${{ steps.vars.outputs.cloud_provider == 'aws' }}
+        id: login-ecr-aws
+        uses: aws-actions/amazon-ecr-login@v1
+        
+      # Azure ACR Login
+      - name: Login to Azure Container Registry (Azure)
+        if: ${{ steps.vars.outputs.cloud_provider == 'azure' }}
+        uses: azure/docker-login@v1
+        with:
+          login-server: ${{ secrets.AZURE_REGISTRY_URL }}
+          username: ${{ secrets.AZURE_REGISTRY_USERNAME }}
+          password: ${{ secrets.AZURE_REGISTRY_PASSWORD }}
+          
+      # GCP Artifact Registry Login
+      - name: Auth to Google Cloud (GCP)
+        if: ${{ steps.vars.outputs.cloud_provider == 'gcp' }}
+        uses: google-github-actions/auth@v1
+        with:
+          credentials_json: ${{ secrets.GOOGLE_CREDENTIALS }}
+          
+      - name: Set up gcloud CLI (GCP) 
+        if: ${{ steps.vars.outputs.cloud_provider == 'gcp' }}
+        uses: google-github-actions/setup-gcloud@v1
+        
+      - name: Authorize Docker push (GCP)
+        if: ${{ steps.vars.outputs.cloud_provider == 'gcp' }}
+        run: |
+          gcloud auth configure-docker ${{ secrets.GCP_REGISTRY_URL }} --quiet
+      
+      # Build and push container images
+      - name: Build and push Model API image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: ./deployment/api/Dockerfile
+          build-args: |
+            BUILD_ENV=${{ steps.vars.outputs.environment }}
+          push: true
+          tags: |
+            ${{ steps.vars.outputs.registry }}/model-api:${{ steps.tag.outputs.tag }}
+            ${{ steps.vars.outputs.registry }}/model-api:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          
+      - name: Build and push Model Trainer image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: ./deployment/trainer/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.vars.outputs.registry }}/model-trainer:${{ steps.tag.outputs.tag }}
+            ${{ steps.vars.outputs.registry }}/model-trainer:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy-infrastructure:
+    name: Deploy Infrastructure
+    needs: build
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && github.event.inputs.deploy_infra == 'true')
+    runs-on: ubuntu-latest
+    environment: ${{ needs.build.outputs.environment }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      # AWS Authentication
+      - name: Configure AWS credentials (AWS)
+        if: ${{ needs.build.outputs.cloud_provider == 'aws' }}
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Azure Authentication
+      - name: Azure Login (Azure)
+        if: ${{ needs.build.outputs.cloud_provider == 'azure' }}
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      # GCP Authentication
+      - name: Auth to Google Cloud (GCP)
+        if: ${{ needs.build.outputs.cloud_provider == 'gcp' }}
+        uses: google-github-actions/auth@v1
+        with:
+          credentials_json: ${{ secrets.GOOGLE_CREDENTIALS }}
+
+      # Initialize Terraform
+      - name: Terraform Init
+        run: |
+          cd terraform
+          terraform init \
+            -backend-config="key=${{ needs.build.outputs.environment }}/terraform.tfstate"
+
+      # Plan Terraform changes
+      - name: Terraform Plan
+        id: plan
+        run: |
+          cd terraform
+          terraform plan -var="cloud_provider=${{ needs.build.outputs.cloud_provider }}" \
+                         -var="environment=${{ needs.build.outputs.environment }}" \
+                         -var="image_tag=${{ needs.build.outputs.image_tag }}" \
+                         -out=tfplan
+
+      # Apply Terraform changes
+      - name: Terraform Apply
+        run: |
+          cd terraform
+          terraform apply -auto-approve tfplan
+
+      # Export infrastructure outputs for next jobs
+      - name: Export Terraform Outputs
+        id: tf-outputs
+        run: |
+          cd terraform
+          # Export key outputs as step outputs
+          echo "::set-output name=cluster_name::$(terraform output -raw cluster_name)"
+          echo "::set-output name=kubeconfig_cmd::$(terraform output -raw kubeconfig_command)"
+          echo "::set-output name=model_registry::$(terraform output -raw model_registry_url)"
+
+      # Save outputs as artifacts for later jobs
+      - name: Save Terraform Outputs
+        uses: actions/upload-artifact@v3
+        with:
+          name: terraform-outputs
+          path: |
+            terraform/terraform.tfstate
+            terraform/outputs.json
+          retention-days: 5
+
+  deploy-application:
+    name: Deploy Application
+    needs: [build, deploy-infrastructure]
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && github.event.inputs.deploy_app == 'true')
+    runs-on: ubuntu-latest
+    environment: ${{ needs.build.outputs.environment }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      # Download terraform outputs
+      - name: Download terraform outputs
+        uses: actions/download-artifact@v3
+        with:
+          name: terraform-outputs
+
+      # AWS Authentication
+      - name: Configure AWS credentials (AWS)
+        if: ${{ needs.build.outputs.cloud_provider == 'aws' }}
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Azure Authentication
+      - name: Azure Login (Azure)
+        if: ${{ needs.build.outputs.cloud_provider == 'azure' }}
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      # GCP Authentication
+      - name: Auth to Google Cloud (GCP)
+        if: ${{ needs.build.outputs.cloud_provider == 'gcp' }}
+        uses: google-github-actions/auth@v1
+        with:
+          credentials_json: ${{ secrets.GOOGLE_CREDENTIALS }}
+
+      # Install kubectl
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'latest'
+
+      # Setup kubeconfig based on cloud provider
+      - name: Configure kubeconfig
+        run: |
+          if [ "${{ needs.build.outputs.cloud_provider }}" == "aws" ]; then
+            aws eks update-kubeconfig --name $(cat outputs.json | jq -r .cluster_name.value) --region ${{ env.AWS_REGION }}
+          elif [ "${{ needs.build.outputs.cloud_provider }}" == "azure" ]; then
+            az aks get-credentials --name $(cat outputs.json | jq -r .cluster_name.value) --resource-group $(cat outputs.json | jq -r .resource_group.value)
+          elif [ "${{ needs.build.outputs.cloud_provider }}" == "gcp" ]; then
+            gcloud container clusters get-credentials $(cat outputs.json | jq -r .cluster_name.value) --region $(cat outputs.json | jq -r .region.value)
+          fi
+
+      # Install Helm
+      - name: Set up Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: 'latest'
+
+      # Deploy ML infrastructure components
+      - name: Deploy ML infrastructure
+        run: |
+          # Create namespaces
+          kubectl create namespace ml-deploy --dry-run=client -o yaml | kubectl apply -f -
+          kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
+          
+          # Apply network policies
+          kubectl apply -f kubernetes/security/network-policies.yaml
+          
+          # Install model-api and related services
+          export REGISTRY_URL="${{ needs.build.outputs.registry }}"
+          export TAG="${{ needs.build.outputs.image_tag }}"
+          
+          # Use envsubst to replace variables in Kubernetes manifests
+          envsubst < kubernetes/deployments/model-api-deployment.yaml | kubectl apply -f -
+          kubectl apply -f kubernetes/services/model-api-service.yaml
+          
+          # Deploy via Helm charts
+          helm upgrade --install model-deployment ./kubernetes/charts/model-deployment \
+            --namespace ml-deploy \
+            --set global.environment=${{ needs.build.outputs.environment }} \
+            --set global.cloudProvider=${{ needs.build.outputs.cloud_provider }} \
+            --set global.images.registry=${{ needs.build.outputs.registry }} \
+            --set modelApi.image.tag=${{ needs.build.outputs.image_tag }}
+
+      # Verify deployment
+      - name: Verify deployment
+        run: |
+          kubectl rollout status deployment/model-api -n ml-deploy --timeout=5m
+          
+          # Check that the pods are running
+          POD_COUNT=$(kubectl get pods -n ml-deploy -l app=model-api --field-selector=status.phase=Running --no-headers | wc -l)
+          if [ "$POD_COUNT" -lt 2 ]; then
+            echo "Not enough model-api pods are running. Expected at least 2, but got $POD_COUNT"
+            exit 1
+          fi
+          
+          echo "Deployment successfully verified!"
+
+  post-deployment-tests:
+    name: Post-Deployment Tests
+    needs: [build, deploy-infrastructure, deploy-application]
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && github.event.inputs.deploy_app == 'true')
+    runs-on: ubuntu-latest
+    environment: ${{ needs.build.outputs.environment }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          
+      - name: Install testing dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pytest-cov requests
+
+      # Configure kubectl from previous steps
+      - name: Download terraform outputs
+        uses: actions/download-artifact@v3
+        with:
+          name: terraform-outputs
+
+      # Cloud-specific authentication as in previous steps
+      # (AWS/Azure/GCP authentication code would be here, omitted for brevity)
+
+      # Configure kubectl
+      - name: Configure kubeconfig
+        run: |
+          # Similar to previous step to configure kubectl
+          # (Cloud-specific kubectl config would be here)
+
+      # Port-forward the service for local testing
+      - name: Port-forward model-api service
+        run: |
+          kubectl port-forward svc/model-api 8000:8000 -n ml-deploy &
+          sleep 10  # Give time for port-forwarding to establish
+          
+      # Run integration tests against the deployed API
+      - name: Run integration tests
+        run: |
+          cd tests/integration
+          pytest test_model_api.py --junitxml=test-results.xml
+          
+      # Upload test results as artifacts
+      - name: Upload test results
+        uses: actions/upload-artifact@v3
+        with:
+          name: integration-test-results
+          path: tests/integration/test-results.xml
+          retention-days: 5
+          
+      # Notify on failure
+      - name: Notify on failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1.23.0
+        with:
+          payload: |
+            {
+              "text": "⚠️ Post-deployment tests failed for ${{ needs.build.outputs.environment }} in the ${{ needs.build.outputs.cloud_provider }} environment!",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*ML Pipeline Deployment Failed*\n⚠️ Post-deployment tests failed for ${{ needs.build.outputs.environment }} in the ${{ needs.build.outputs.cloud_provider }} environment!"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Environment:*\n${{ needs.build.outputs.environment }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Cloud Provider:*\n${{ needs.build.outputs.cloud_provider }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Image Tag:*\n${{ needs.build.outputs.image_tag }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Workflow Run:*\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

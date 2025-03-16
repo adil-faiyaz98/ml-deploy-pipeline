@@ -1,0 +1,62 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: model-drift-detection
+  namespace: ml-deploy
+spec:
+  schedule: "0 */2 * * *"  # Run every 2 hours
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app: model-drift-detector
+        spec:
+          containers:
+          - name: drift-detector
+            image: ${REGISTRY_URL}/model-monitoring:${TAG}
+            command: ["python", "-m", "src.monitoring.drift_detection"]
+            env:
+            - name: MODEL_API_URL
+              value: "http://model-api:8000"
+            - name: MLFLOW_TRACKING_URI
+              value: "http://mlflow.ml-deploy:5000"
+            - name: REFERENCE_DATA_PATH
+              value: "/data/reference/baseline.parquet"
+            - name: THRESHOLD_CONFIG_PATH
+              value: "/etc/config/drift_thresholds.json"
+            - name: PROMETHEUS_PUSHGATEWAY
+              value: "http://prometheus-pushgateway.monitoring:9091"
+            - name: ALERT_WEBHOOK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: monitoring-secrets
+                  key: alert_webhook_url
+            resources:
+              requests:
+                cpu: 500m
+                memory: 1Gi
+              limits:
+                cpu: 2
+                memory: 4Gi
+            volumeMounts:
+            - name: reference-data
+              mountPath: /data/reference
+            - name: config-volume
+              mountPath: /etc/config
+            - name: results-volume
+              mountPath: /results
+          volumes:
+          - name: reference-data
+            persistentVolumeClaim:
+              claimName: reference-data-pvc
+          - name: config-volume
+            configMap:
+              name: drift-detection-config
+          - name: results-volume
+            persistentVolumeClaim:
+              claimName: drift-results-pvc
+          restartPolicy: Never

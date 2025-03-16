@@ -1,0 +1,85 @@
+apiVersion: networking.istio.io/v1alpha3
+kind: Gateway
+metadata:
+  name: ml-api-gateway
+  namespace: istio-system
+spec:
+  selector:
+    istio: ingressgateway
+  servers:
+  - port:
+      number: 80
+      name: http
+      protocol: HTTP
+    hosts:
+    - "api.ml-deploy.example.com"
+    tls:
+      httpsRedirect: true
+  - port:
+      number: 443
+      name: https
+      protocol: HTTPS
+    hosts:
+    - "api.ml-deploy.example.com"
+    tls:
+      mode: SIMPLE
+      credentialName: ml-api-cert # Must exist in istio-system namespace
+
+---
+apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
+metadata:
+  name: ml-api-routes
+  namespace: istio-system
+spec:
+  hosts:
+  - "api.ml-deploy.example.com"
+  gateways:
+  - ml-api-gateway
+  http:
+  # Model inference API
+  - match:
+    - uri:
+        prefix: /v1/predict
+    route:
+    - destination:
+        host: model-api.ml-deploy.svc.cluster.local
+        port:
+          number: 8000
+    retries:
+      attempts: 3
+      perTryTimeout: 2s
+    timeout: 5s
+    
+  # Feature service
+  - match:
+    - uri:
+        prefix: /v1/features
+    route:
+    - destination:
+        host: feast-serving.ml-deploy.svc.cluster.local
+        port:
+          number: 8080
+    retries:
+      attempts: 2
+      perTryTimeout: 1s
+    timeout: 3s
+    
+  # MLflow UI
+  - match:
+    - uri:
+        prefix: /mlflow
+    rewrite:
+      uri: /
+    route:
+    - destination:
+        host: mlflow.ml-deploy.svc.cluster.local
+        port:
+          number: 5000
+          
+  # Default fallback
+  - route:
+    - destination:
+        host: api-default.ml-deploy.svc.cluster.local
+        port:
+          number: 8080

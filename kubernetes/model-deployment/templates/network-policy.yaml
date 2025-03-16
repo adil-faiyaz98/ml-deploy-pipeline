@@ -1,0 +1,74 @@
+{{- if .Values.security.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "model-api.fullname" . }}
+  labels:
+    {{- include "model-api.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "model-api.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        {{- if .Values.security.networkPolicy.ingressNamespaceSelector }}
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.security.networkPolicy.ingressNamespaceSelector | nindent 14 }}
+        {{- end }}
+        {{- if .Values.security.networkPolicy.ingressPodSelector }}
+        - podSelector:
+            matchLabels:
+              {{- toYaml .Values.security.networkPolicy.ingressPodSelector | nindent 14 }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.service.port }}
+  egress:
+    # Allow DNS resolution
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+        - podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Allow traffic to database
+    - to:
+        {{- if .Values.security.networkPolicy.databaseSelector }}
+        - podSelector:
+            matchLabels:
+              {{- toYaml .Values.security.networkPolicy.databaseSelector | nindent 14 }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: 5432
+    # Allow traffic to Redis
+    - to:
+        {{- if .Values.security.networkPolicy.redisSelector }}
+        - podSelector:
+            matchLabels:
+              {{- toYaml .Values.security.networkPolicy.redisSelector | nindent 14 }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: 6379
+    # Allow traffic to metrics server
+    {{- if .Values.monitoring.enabled }}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 9090
+    {{- end }}
+{{- end }}

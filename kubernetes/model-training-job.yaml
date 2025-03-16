@@ -1,0 +1,84 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: model-training-job
+  namespace: ml-system
+spec:
+  schedule: "0 2 * * *"  # Run daily at 2 AM
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 7200  # 2 hours timeout
+      template:
+        metadata:
+          labels:
+            app: model-training
+            component: batch-job
+        spec:
+          restartPolicy: Never
+          serviceAccountName: model-training-sa
+          containers:
+            - name: model-trainer
+              image: ${REGISTRY_URL}/model-trainer:${TAG}
+              command:
+                - "python"
+                - "-m"
+                - "src.train-model.model_train"
+                - "--config"
+                - "/config/training_config.json"
+              env:
+                - name: PYTHONUNBUFFERED
+                  value: "1"
+                - name: MODEL_OUTPUT_DIR
+                  value: "/models"
+                - name: MLFLOW_TRACKING_URI
+                  value: "http://mlflow.ml-system.svc.cluster.local:5000"
+              envFrom:
+                - configMapRef:
+                    name: training-config
+                - secretRef:
+                    name: training-secrets
+              resources:
+                limits:
+                  cpu: 8
+                  memory: 32Gi
+                  # Uncomment for GPU training
+                  # nvidia.com/gpu: 1
+                requests:
+                  cpu: 4
+                  memory: 16Gi
+              volumeMounts:
+                - name: models-volume
+                  mountPath: /models
+                - name: config-volume
+                  mountPath: /config
+                - name: data-volume
+                  mountPath: /data
+                  readOnly: true
+              securityContext:
+                allowPrivilegeEscalation: false
+                runAsUser: 1000
+                runAsGroup: 1000
+                readOnlyRootFilesystem: false
+          volumes:
+            - name: models-volume
+              persistentVolumeClaim:
+                claimName: model-storage
+            - name: config-volume
+              configMap:
+                name: training-config
+            - name: data-volume
+              persistentVolumeClaim:
+                claimName: training-data
+          affinity:
+            nodeAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                nodeSelectorTerms:
+                - matchExpressions:
+                  - key: workload
+                    operator: In
+                    values:
+                    - ml-training

@@ -1,0 +1,148 @@
+# Global values for all deployments
+global:
+  environment: dev
+  cloudProvider: aws  # aws, azure, gcp
+  domain: ml-deploy.example.com
+  images:
+    pullPolicy: Always
+    registry: ${CONTAINER_REGISTRY}
+  imagePullSecrets: []
+  
+  # Cloud provider specific settings
+  aws:
+    region: us-west-2
+    serviceAccountAnnotation: eks.amazonaws.com/role-arn
+    storageClass: gp2
+  
+  azure:
+    location: eastus
+    serviceAccountAnnotation: azure.workload.identity/client-id
+    storageClass: managed-premium
+  
+  gcp:
+    region: us-central1
+    serviceAccountAnnotation: iam.gke.io/gcp-service-account
+    storageClass: standard
+
+# Model API configuration
+modelApi:
+  enabled: true
+  name: model-api
+  replicaCount: 2
+  
+  image:
+    repository: model-api
+    tag: latest
+  
+  port: 8000
+  
+  service:
+    type: ClusterIP
+    port: 8000
+  
+  ingress:
+    enabled: true
+    annotations:
+      kubernetes.io/ingress.class: nginx
+      cert-manager.io/cluster-issuer: letsencrypt-prod
+    path: /
+    host: api.${global.domain}
+  
+  resources:
+    limits:
+      cpu: 2
+      memory: 4Gi
+    requests:
+      cpu: 500m
+      memory: 1Gi
+  
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 80
+    targetMemoryUtilizationPercentage: 80
+  
+  nodeSelector: {}
+  
+  tolerations: []
+  
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+            - key: app.kubernetes.io/name
+              operator: In
+              values:
+              - model-api
+          topologyKey: kubernetes.io/hostname
+  
+  securityContext:
+    capabilities:
+      drop:
+      - ALL
+    readOnlyRootFilesystem: true
+    allowPrivilegeEscalation: false
+    runAsNonRoot: true
+    runAsUser: 1000
+  
+  livenessProbe:
+    httpGet:
+      path: /health
+      port: http
+    initialDelaySeconds: 30
+    periodSeconds: 15
+  
+  readinessProbe:
+    httpGet:
+      path: /health
+      port: http
+    initialDelaySeconds: 15
+    periodSeconds: 10
+  
+  env:
+    - name: MODEL_DIR
+      value: "/models"
+    - name: LOG_LEVEL
+      value: "INFO"
+    - name: ENABLE_METRICS
+      value: "true"
+  
+  envFrom:
+    - configMapRef:
+        name: model-api-config
+    - secretRef:
+        name: model-api-secrets
+  
+  persistence:
+    enabled: true
+    mountPath: /models
+    storageClass: "${global.aws.storageClass}"
+    accessMode: ReadWriteOnce
+    size: 10Gi
+  
+  config:
+    mountPath: /app/config
+    files:
+      model_config.json: |
+        {
+          "api": {
+            "host": "0.0.0.0",
+            "port": 8000,
+            "cors_origins": ["*"],
+            "workers": 4
+          },
+          "models": {
+            "dir": "/models",
+            "default_version": "latest",
+            "auto_reload": true,
+            "reload_interval": 60
+          },
+          "logging": {
+            "level": "info",
+            "request_logging": true
+          }
+        }

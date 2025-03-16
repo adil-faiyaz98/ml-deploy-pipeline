@@ -1,0 +1,94 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: feast-serving
+  namespace: ml-deploy
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: feast-serving
+  template:
+    metadata:
+      labels:
+        app: feast-serving
+    spec:
+      containers:
+      - name: feast-serving
+        image: feastdev/feast-serving:0.26.0
+        ports:
+        - containerPort: 6566
+          name: grpc
+        - containerPort: 8080
+          name: http
+        env:
+        - name: FEAST_CORE_URL
+          value: "feast-core.ml-deploy.svc.cluster.local:6565"
+        - name: FEAST_SERVING_STORE_CONFIG_PATH
+          value: "/etc/feast/store.yaml"
+        - name: SPRING_PROFILES_ACTIVE
+          value: "production"
+        - name: JAVA_OPTS
+          value: "-Xms1g -Xmx2g"
+        volumeMounts:
+        - name: feast-config
+          mountPath: /etc/feast
+        resources:
+          limits:
+            cpu: 2
+            memory: 4Gi
+          requests:
+            cpu: 500m
+            memory: 1Gi
+        livenessProbe:
+          httpGet:
+            path: /metrics
+            port: 8080
+          initialDelaySeconds: 60
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /metrics
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+      volumes:
+      - name: feast-config
+        configMap:
+          name: feast-config
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: feast-config
+  namespace: ml-deploy
+data:
+  store.yaml: |
+    name: online-store
+    type: REDIS
+    redis_config:
+      host: ${REDIS_HOST}
+      port: 6379
+      ssl: true
+    
+    name: offline-store
+    type: BIGQUERY
+    bigquery_config:
+      project_id: ${GCP_PROJECT_ID}
+      dataset_id: ${FEATURE_STORE_DATASET}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: feast-serving
+  namespace: ml-deploy
+spec:
+  selector:
+    app: feast-serving
+  ports:
+  - port: 6566
+    targetPort: 6566
+    name: grpc
+  - port: 8080
+    targetPort: 8080
+    name: http

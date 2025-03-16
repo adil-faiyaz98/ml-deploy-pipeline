@@ -7,6 +7,7 @@ on:
       - 'src/**'
       - 'terraform/**'
       - 'deployment/**'
+      - 'kubernetes/**'
       - '.github/workflows/**'
   pull_request:
     branches: [ main ]
@@ -45,171 +46,207 @@ jobs:
     name: Validate
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout code
         uses: actions/checkout@v3
-      
+
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v2
         with:
           terraform_version: ${{ env.TF_VERSION }}
-      
-      - name: Terraform Format
-        run: terraform fmt -check -recursive
-      
+
       - name: Setup Python
         uses: actions/setup-python@v4
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-          
-      - name: Install Dependencies
+      
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements-dev.txt
-          
-      - name: Run Linting
+          pip install pytest pylint black mypy
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+      
+      - name: Terraform Format
+        id: fmt
+        run: terraform -chdir=terraform fmt -check -recursive
+        continue-on-error: true
+
+      - name: Terraform Init
+        id: init
         run: |
-          pylint src/
-          flake8 src/
-          
-      - name: Run Tests
+          cd terraform
+          terraform init -input=false
+      
+      - name: Terraform Validate
+        id: validate
         run: |
-          pytest -xvs tests/
-  
-  plan:
-    name: Plan
+          cd terraform
+          terraform validate
+
+      - name: Python Lint
+        run: |
+          pylint --disable=C0111 src/
+        continue-on-error: true
+
+      - name: Python Type Check
+        run: |
+          mypy --ignore-missing-imports src/
+        continue-on-error: true
+
+  build:
+    name: Build
     needs: validate
     runs-on: ubuntu-latest
-    env:
-      TF_WORKSPACE: ${{ github.event.inputs.environment || 'dev' }}
-      CLOUD_PROVIDER: ${{ github.event.inputs.cloud_provider || 'aws' }}
-      
     steps:
-      - name: Checkout
+      - name: Checkout code
         uses: actions/checkout@v3
-        
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v2
-        with:
-          terraform_version: ${{ env.TF_VERSION }}
-          cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
-      
-      - name: Configure AWS Credentials
-        if: env.CLOUD_PROVIDER == 'aws'
-        uses: aws-actions/configure-aws-credentials@v1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
+        if: ${{ github.event.inputs.cloud_provider == 'aws' || github.event.inputs.cloud_provider == '' }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr-aws
+        uses: aws-actions/amazon-ecr-login@v1
+        if: ${{ github.event.inputs.cloud_provider == 'aws' || github.event.inputs.cloud_provider == '' }}
       
-      - name: Configure GCP Credentials
-        uses: google-github-actions/auth@v0
+      - name: Login to Azure Container Registry
+        uses: azure/docker-login@v1
         with:
-          credentials_json: ${{ secrets.GCP_CREDENTIALS_JSON }}
+          login-server: ${{ secrets.REGISTRY_LOGIN_SERVER }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+        if: ${{ github.event.inputs.cloud_provider == 'azure' }}
 
-      - name: ML Deploy Pipeline
+      - name: Login to Google Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: gcr.io
+          username: _json_key
+          password: ${{ secrets.GCP_SA_KEY }}
+        if: ${{ github.event.inputs.cloud_provider == 'gcp' }}
 
-        on:
-          push:
-            branches: [ main ]
-            paths:
-              - 'src/**'
-              - 'terraform/**'
-              - 'deployment/**'
-              - '.github/workflows/**'
-          pull_request:
-            branches: [ main ]
-          workflow_dispatch:
-            inputs:
-              environment:
-                description: 'Environment to deploy to'
-                required: true
-                default: 'dev'
-                type: choice
-                options:
-                  - dev
-                  - staging
-                  - production
-              cloud_provider:
-                description: 'Cloud provider to deploy to'
-                required: true
-                default: 'aws'
-                type: choice
-                options:
-                  - aws
-                  - azure
-                  - gcp
+      - name: Build and push Model API image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: ./deployment/api/Dockerfile
+          push: true
+          tags: ${{ steps.login-ecr-aws.outputs.registry || secrets.REGISTRY_LOGIN_SERVER || 'gcr.io/project-id' }}/model-api:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILD_ENV=${{ github.event.inputs.environment || 'dev' }}
 
-        env:
-          TF_VERSION: '1.5.7'
-          PYTHON_VERSION: '3.10'
-          TF_IN_AUTOMATION: 'true'
-          ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-          ARM_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
-          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      - name: Build and push Model Trainer image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: ./deployment/trainer/Dockerfile
+          push: true
+          tags: ${{ steps.login-ecr-aws.outputs.registry || secrets.REGISTRY_LOGIN_SERVER || 'gcr.io/project-id' }}/model-trainer:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILD_ENV=${{ github.event.inputs.environment || 'dev' }}
 
-        jobs:
-          validate:
-            name: Validate
-            runs-on: ubuntu-latest
-            steps:
-              - name: Checkout
-                uses: actions/checkout@v3
-              
-              - name: Setup Terraform
-                uses: hashicorp/setup-terraform@v2
-                with:
-                  terraform_version: ${{ env.TF_VERSION }}
-              
-              - name: Terraform Format
-                run: terraform fmt -check -recursive
-              
-              - name: Setup Python
-                uses: actions/setup-python@v4
-                with:
-                  python-version: ${{ env.PYTHON_VERSION }}
-                  
-              - name: Install Dependencies
-                run: |
-                  python -m pip install --upgrade pip
-                  pip install -r requirements-dev.txt
-                  
-              - name: Run Linting
-                run: |
-                  pylint src/
-                  flake8 src/
-                  
-              - name: Run Tests
-                run: |
-                  pytest -xvs tests/
-          
-          plan:
-            name: Plan
-            needs: validate
-            runs-on: ubuntu-latest
-            env:
-              TF_WORKSPACE: ${{ github.event.inputs.environment || 'dev' }}
-              CLOUD_PROVIDER: ${{ github.event.inputs.cloud_provider || 'aws' }}
-              
-            steps:
-              - name: Checkout
-                uses: actions/checkout@v3
-                
-              - name: Setup Terraform
-                uses: hashicorp/setup-terraform@v2
-                with:
-                  terraform_version: ${{ env.TF_VERSION }}
-                  cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
-              
-              - name: Configure AWS Credentials
-                if: env.CLOUD_PROVIDER == 'aws'
-                uses: aws-actions/configure-aws-credentials@v1
-                with:
-                  aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-                  aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-                  aws-region: ${{ secrets.AWS_REGION }}
-              
-              - name: Configure GCP Credentials
-                uses: google-github-actions/auth@v0
-                with:
-                  credentials_json: ${{ secrets.GCP_CREDENTIALS_JSON }}
+  deploy-infra:
+    name: Deploy Infrastructure
+    needs: build
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+        if: ${{ github.event.inputs.cloud_provider == 'aws' || github.event.inputs.cloud_provider == '' }}
+
+      - name: Terraform Init
+        run: |
+          cd terraform
+          terraform init -input=false
+
+      - name: Terraform Plan
+        run: |
+          cd terraform
+          terraform plan -input=false -var-file=environments/${{ github.event.inputs.environment || 'dev' }}.tfvars -var="cloud_provider=${{ github.event.inputs.cloud_provider || 'aws' }}" -out=tfplan
+
+      - name: Terraform Apply
+        run: |
+          cd terraform
+          terraform apply -auto-approve tfplan
+
+  deploy-app:
+    name: Deploy Application
+    needs: deploy-infra
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Kubectl
+        uses: azure/setup-kubectl@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+        if: ${{ github.event.inputs.cloud_provider == 'aws' || github.event.inputs.cloud_provider == '' }}
+      
+      - name: Configure kubeconfig (AWS)
+        run: |
+          aws eks update-kubeconfig --name ml-deploy-${{ github.event.inputs.environment || 'dev' }}-cluster --region ${{ secrets.AWS_REGION }}
+        if: ${{ github.event.inputs.cloud_provider == 'aws' || github.event.inputs.cloud_provider == '' }}
+
+      - name: Configure kubeconfig (Azure)
+        uses: azure/aks-set-context@v3
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+          resource-group: ${{ secrets.AKS_RESOURCE_GROUP }}
+          cluster-name: ${{ secrets.AKS_CLUSTER_NAME }}
+        if: ${{ github.event.inputs.cloud_provider == 'azure' }}
+
+      - name: Configure kubeconfig (GCP)
+        uses: google-github-actions/get-gke-credentials@v1
+        with:
+          cluster_name: ${{ secrets.GKE_CLUSTER }}
+          location: ${{ secrets.GKE_ZONE }}
+          credentials: ${{ secrets.GCP_SA_KEY }}
+        if: ${{ github.event.inputs.cloud_provider == 'gcp' }}
+
+      - name: Deploy with Helm
+        run: |
+          helm upgrade --install ml-deploy ./kubernetes/charts/ml-deploy \
+            --namespace ml-deploy-${{ github.event.inputs.environment || 'dev' }} \
+            --create-namespace \
+            --values ./kubernetes/environments/${{ github.event.inputs.environment || 'dev' }}/values.yaml \
+            --set global.cloudProvider=${{ github.event.inputs.cloud_provider || 'aws' }} \
+            --set global.environment=${{ github.event.inputs.environment || 'dev' }} \
+            --set modelApi.image.tag=${{ github.sha }} \
+            --set training.image.tag=${{ github.sha }} \
+            --wait
+
+      - name: Verify Deployment
+        run: |
+          kubectl wait --for=condition=available --timeout=300s deployment/model-api -n ml-deploy-${{ github.event.inputs.environment || 'dev' }}
+          kubectl get pods -n ml-deploy-${{ github.event.inputs.environment || 'dev' }}

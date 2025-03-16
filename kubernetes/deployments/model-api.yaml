@@ -1,0 +1,154 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: model-api
+  namespace: ml-deploy
+  labels:
+    app: model-api
+    component: inference
+    version: ${IMAGE_TAG}
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: model-api
+  template:
+    metadata:
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: "/metrics"
+        prometheus.io/port: "8000"
+        checksum/config: ${CONFIG_CHECKSUM}
+      labels:
+        app: model-api
+        component: inference
+    spec:
+      serviceAccountName: model-api-sa
+      securityContext:
+        fsGroup: 1000
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: model-api
+        image: ${REGISTRY_URL}/model-api:${IMAGE_TAG}
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8000
+          name: http
+        resources:
+          limits:
+            cpu: 2
+            memory: 4Gi
+            # Add GPU resources if needed
+            # nvidia.com/gpu: 1
+          requests:
+            cpu: 1
+            memory: 2Gi
+        env:
+        - name: MODEL_DIR
+          value: /models
+        - name: MODEL_CONFIG_PATH
+          value: /app/config/model_config.json
+        - name: LOG_LEVEL
+          value: INFO
+        - name: DATABASE_URI
+          valueFrom:
+            secretKeyRef:
+              name: model-api-secrets
+              key: database-uri
+        - name: REDIS_URI
+          valueFrom:
+            secretKeyRef:
+              name: model-api-secrets
+              key: redis-uri
+        - name: MLFLOW_TRACKING_URI
+          value: http://mlflow.ml-deploy.svc.cluster.local:5000
+        - name: ENABLE_AUTH
+          value: "true"
+        - name: PROMETHEUS_MULTIPROC_DIR
+          value: /tmp
+        - name: API_WORKERS
+          value: "4"
+        - name: MAX_PAYLOAD_SIZE
+          value: "50MB"
+        - name: TIMEOUT
+          value: "300"
+        volumeMounts:
+        - name: models
+          mountPath: /models
+          readOnly: true
+        - name: config
+          mountPath: /app/config
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+          successThreshold: 1
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+          successThreshold: 1
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 12
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 1000
+          runAsGroup: 1000
+          capabilities:
+            drop:
+            - ALL
+      volumes:
+      - name: models
+        persistentVolumeClaim:
+          claimName: model-storage
+      - name: config
+        configMap:
+          name: model-api-config
+      - name: tmp
+        emptyDir: {}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - model-api
+              topologyKey: kubernetes.io/hostname
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: workload-type
+                operator: In
+                values:
+                - model-serving
+      terminationGracePeriodSeconds: 60

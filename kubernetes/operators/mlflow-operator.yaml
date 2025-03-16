@@ -1,0 +1,50 @@
+apiVersion: mlflow.org/v1alpha1
+kind: MLflowServer
+metadata:
+  name: mlflow
+  namespace: ml-deploy
+spec:
+  replicas: 2
+  image: ghcr.io/mlflow/mlflow:2.7.1
+  tracking:
+    database:
+      type: postgresql
+      host: ${DB_HOST}
+      port: 5432
+      name: mlflow
+      user: ${DB_USER}
+      passwordSecretRef:
+        name: mlflow-db-credentials
+        key: password
+  artifacts:
+    type: s3
+    s3:
+      bucket: ${MODEL_ARTIFACTS_BUCKET}
+      endpointUrl: ${S3_ENDPOINT_URL}
+      accessKeyIdSecretRef:
+        name: s3-credentials
+        key: accessKeyId
+      secretAccessKeySecretRef:
+        name: s3-credentials
+        key: secretAccessKey
+  resources:
+    requests:
+      memory: "1Gi"
+      cpu: "0.5"
+    limits:
+      memory: "2Gi"
+      cpu: "1"
+  ingress:
+    enabled: true
+    annotations:
+      kubernetes.io/ingress.class: nginx
+      cert-manager.io/cluster-issuer: letsencrypt-prod
+    hosts:
+      - host: mlflow.ml-deploy.example.com
+        paths:
+          - path: /
+            pathType: Prefix
+    tls:
+      - secretName: mlflow-tls
+        hosts:
+          - mlflow.ml-deploy.example.com

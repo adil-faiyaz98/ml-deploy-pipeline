@@ -1,0 +1,47 @@
+apiVersion: audit.k8s.io/v1
+kind: Policy
+metadata:
+  name: ml-deploy-audit-policy
+rules:
+  # Log all requests at the Metadata level
+  - level: Metadata
+    resources:
+      - group: ""
+        resources: ["pods", "services", "configmaps", "secrets"]
+  
+  # Log all write operations at the RequestResponse level
+  - level: RequestResponse
+    verbs: ["create", "update", "patch", "delete"]
+    resources:
+      - group: ""  
+      - group: "apps"
+      - group: "batch"
+  
+  # Log all accesses to secrets at the highest level
+  - level: RequestResponse
+    resources:
+    - group: ""
+      resources: ["secrets"]
+  
+  # Log all authorization failures
+  - level: RequestResponse
+    userGroups: ["system:unauthenticated"]
+    
+  # Log pod exec and attach
+  - level: RequestResponse
+    resources:
+    - group: ""
+      resources: ["pods/exec", "pods/attach"]
+    
+  # Log changes to RBAC
+  - level: RequestResponse
+    resources:
+    - group: "rbac.authorization.k8s.io"
+    
+  # Don't log routine events
+  - level: None
+    users: ["system:kube-proxy"]
+    verbs: ["watch"]
+    resources:
+    - group: ""
+      resources: ["endpoints", "services"]

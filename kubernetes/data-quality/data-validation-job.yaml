@@ -1,0 +1,57 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: data-validation
+  namespace: ml-deploy
+spec:
+  schedule: "0 */6 * * *"  # Run every 6 hours
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          containers:
+          - name: data-validator
+            image: ${REGISTRY_URL}/data-validator:${TAG}
+            args:
+            - "python"
+            - "-m"
+            - "src.data_validation.validate"
+            - "--config"
+            - "/etc/config/validation_config.json"
+            - "--output"
+            - "/data/validation_results"
+            env:
+            - name: LOG_LEVEL
+              value: "INFO"
+            volumeMounts:
+            - name: config-volume
+              mountPath: /etc/config
+            - name: data-volume
+              mountPath: /data
+            - name: validation-results
+              mountPath: /data/validation_results
+            resources:
+              limits:
+                cpu: 2
+                memory: 4Gi
+              requests:
+                cpu: 500m
+                memory: 2Gi
+            securityContext:
+              allowPrivilegeEscalation: false
+              runAsUser: 1000
+              runAsGroup: 1000
+              readOnlyRootFilesystem: false
+          volumes:
+          - name: config-volume
+            configMap:
+              name: data-validation-config
+          - name: data-volume
+            persistentVolumeClaim:
+              claimName: ml-data
+          - name: validation-results
+            persistentVolumeClaim:
+              claimName: validation-results
+          restartPolicy: Never

@@ -681,9 +681,9 @@ provider "google-beta" {
 
 locals {
   name_prefix = "${var.project_name}-${var.environment}"
-  region      = var.region
+  location    = var.region
   
-  common_tags = {
+  common_labels = {
     project     = var.project_name
     environment = var.environment
     terraform   = "true"
@@ -693,71 +693,119 @@ locals {
   
   # Machine type mappings
   machine_types = {
-    "small"      = "e2-standard-2"
-    "medium"     = "e2-standard-4"
-    "large"      = "e2-standard-8"
-    "xlarge"     = "e2-standard-16"
-    "gpu-small"  = "n1-standard-4"
+    "small"  = "n2-standard-2"
+    "medium" = "n2-standard-4"
+    "large"  = "n2-standard-8"
+    "xlarge" = "n2-standard-16"
+    "gpu-small" = "n1-standard-4"
     "gpu-medium" = "n1-standard-8"
-    "gpu-large"  = "n1-standard-16"
+    "gpu-large" = "n1-standard-16"
   }
   
-  # Database tier mappings
-  db_tiers = {
-    "small"  = "db-custom-2-4096"
-    "medium" = "db-custom-4-8192"
-    "large"  = "db-custom-8-16384"
-    "xlarge" = "db-custom-16-32768"
+  # Database instance mappings
+  db_instance_types = {
+    "small"  = "db-g1-small"
+    "medium" = "db-custom-2-4096"
+    "large"  = "db-custom-4-8192"
+    "xlarge" = "db-custom-8-16384"
   }
   
-  # Memory store tier mappings
+  # Redis tier mappings
   redis_tiers = {
-    "small"  = "basic"
-    "medium" = "standard_ha"
-    "large"  = "standard_ha"
+    "small"  = "BASIC"
+    "medium" = "STANDARD_HA"
+    "large"  = "STANDARD_HA"
   }
   
-  # Network configuration
-  network_name          = "${local.name_prefix}-network"
-  subnet_name           = "${local.name_prefix}-subnet"
-  subnet_range          = var.vpc_cidr
-  secondary_ranges = {
-    pods     = "${local.name_prefix}-pods"
-    services = "${local.name_prefix}-services"
+  # GPU types and counts
+  gpu_types = {
+    "gpu-small"  = "nvidia-tesla-t4"
+    "gpu-medium" = "nvidia-tesla-t4"
+    "gpu-large"  = "nvidia-tesla-v100"
   }
-  pods_range     = "10.100.0.0/16"
-  services_range = "10.200.0.0/20"
+  
+  gpu_counts = {
+    "gpu-small"  = 1
+    "gpu-medium" = 2
+    "gpu-large"  = 4
+  }
+  
+  # Network settings
+  network_name = "${local.name_prefix}-network"
+  subnet_name  = "${local.name_prefix}-subnet"
+  subnet_cidr  = "10.0.0.0/16"
+  
+  # Node pools configuration
+  node_pools = [
+    {
+      name               = "ml-compute"
+      machine_type       = var.environment == "production" ? "n2-standard-8" : "n2-standard-4"
+      node_count         = var.desired_nodes
+      min_count          = var.min_nodes
+      max_count          = var.max_nodes
+      disk_size_gb       = 100
+      disk_type          = "pd-ssd"
+      auto_repair        = true
+      auto_upgrade       = true
+      preemptible        = var.environment != "production"
+      accelerator_type   = var.environment == "production" ? "nvidia-tesla-t4" : null
+      accelerator_count  = var.environment == "production" ? 1 : 0
+      labels             = { "workload-type" = "ml-training" }
+      taints             = []
+    },
+    {
+      name               = "api-serving"
+      machine_type       = var.environment == "production" ? "n2-standard-4" : "n2-standard-2"
+      node_count         = 2
+      min_count          = 2
+      max_count          = 10
+      disk_size_gb       = 50
+      disk_type          = "pd-ssd"
+      auto_repair        = true
+      auto_upgrade       = true
+      preemptible        = false
+      accelerator_type   = null
+      accelerator_count  = 0
+      labels             = { "workload-type" = "model-serving" }
+      taints             = []
+    },
+    {
+      name               = "monitoring"
+      machine_type       = "n2-standard-2"
+      node_count         = 1
+      min_count          = 1
+      max_count          = 3
+      disk_size_gb       = 50
+      disk_type          = "pd-standard"
+      auto_repair        = true
+      auto_upgrade       = true
+      preemptible        = var.environment != "production"
+      accelerator_type   = null
+      accelerator_count  = 0
+      labels             = { "workload-type" = "monitoring" }
+      taints             = []
+    }
+  ]
 }
 
 # ------------------------------------------------------------------------------
 # VPC & NETWORK INFRASTRUCTURE
 # ------------------------------------------------------------------------------
-resource "google_compute_network" "vpc" {
+resource "google_compute_network" "vpc_network" {
   name                    = local.network_name
   auto_create_subnetworks = false
   routing_mode            = "GLOBAL"
 }
 
-resource "google_compute_subnetwork" "subnet" {
-  name          = local.subnet_name
-  ip_cidr_range = local.subnet_range
-  region        = local.region
-  network       = google_compute_network.vpc.id
-  
-  secondary_ip_range {
-    range_name    = local.secondary_ranges.pods
-    ip_cidr_range = local.pods_range
-  }
-  
-  secondary_ip_range {
-    range_name    = local.secondary_ranges.services
-    ip_cidr_range = local.services_range
-  }
-  
+resource "google_compute_subnetwork" "subnetwork" {
+  name                     = local.subnet_name
+  ip_cidr_range            = local.subnet_cidr
+  region                   = var.region
+  network                  = google_compute_network.vpc_network.id
   private_ip_google_access = true
   
   log_config {
-    aggregation_interval = "INTERVAL_10_MIN"
+    aggregation_interval = "INTERVAL_5_SEC"
     flow_sampling        = 0.5
     metadata             = "INCLUDE_ALL_METADATA"
   }
@@ -765,14 +813,14 @@ resource "google_compute_subnetwork" "subnet" {
 
 resource "google_compute_router" "router" {
   name    = "${local.name_prefix}-router"
-  region  = local.region
-  network = google_compute_network.vpc.id
+  region  = var.region
+  network = google_compute_network.vpc_network.id
 }
 
 resource "google_compute_router_nat" "nat" {
   name                               = "${local.name_prefix}-nat"
   router                             = google_compute_router.router.name
-  region                             = local.region
+  region                             = var.region
   nat_ip_allocate_option             = "AUTO_ONLY"
   source_subnetwork_ip_ranges_to_nat = "ALL_SUBNETWORKS_ALL_IP_RANGES"
   
@@ -787,65 +835,36 @@ resource "google_compute_router_nat" "nat" {
 # ------------------------------------------------------------------------------
 resource "google_container_cluster" "primary" {
   name     = "${local.name_prefix}-cluster"
-  location = local.region
+  location = var.region
   
-  # We can't create a cluster with no node pool defined, but we want to use
+  # We can't create a cluster with no node pool defined, but we want to only use
   # separately managed node pools. So we create the smallest possible default
   # node pool and immediately delete it.
   remove_default_node_pool = true
   initial_node_count       = 1
   
-  # Enable VPC native networking
-  networking_mode = "VPC_NATIVE"
+  network    = google_compute_network.vpc_network.id
+  subnetwork = google_compute_subnetwork.subnetwork.id
   
-  network    = google_compute_network.vpc.self_link
-  subnetwork = google_compute_subnetwork.subnet.self_link
-  
-  ip_allocation_policy {
-    cluster_secondary_range_name  = local.secondary_ranges.pods
-    services_secondary_range_name = local.secondary_ranges.services
+  release_channel {
+    channel = var.environment == "production" ? "REGULAR" : "RAPID"
   }
   
-  # Enable workload identity
   workload_identity_config {
     workload_pool = "${var.project_id}.svc.id.goog"
   }
   
-  # Enable Autopilot mode for serverless GKE
-  enable_autopilot = var.environment == "production" ? false : true
-  
-  # For non-Autopilot clusters, configure advanced security options
-  dynamic "binary_authorization" {
-    for_each = var.environment == "production" ? [1] : []
-    content {
-      evaluation_mode = "PROJECT_SINGLETON_POLICY_ENFORCE"
-    }
+  private_cluster_config {
+    enable_private_nodes    = true
+    enable_private_endpoint = false
+    master_ipv4_cidr_block  = "172.16.0.0/28"
   }
   
-  # Private cluster configuration for production
-  dynamic "private_cluster_config" {
-    for_each = var.environment == "production" ? [1] : []
-    content {
-      enable_private_nodes    = true
-      enable_private_endpoint = false
-      master_ipv4_cidr_block  = "172.16.0.0/28"
-    }
+  ip_allocation_policy {
+    cluster_ipv4_cidr_block  = "/16"
+    services_ipv4_cidr_block = "/22"
   }
   
-  # Release channel for automatic upgrades
-  release_channel {
-    channel = var.environment == "production" ? "STABLE" : "REGULAR"
-  }
-  
-  # Enable shielded nodes
-  node_config {
-    shielded_instance_config {
-      enable_secure_boot          = true
-      enable_integrity_monitoring = true
-    }
-  }
-  
-  # Disable legacy Auth
   master_auth {
     client_certificate_config {
       issue_client_certificate = false
@@ -853,20 +872,14 @@ resource "google_container_cluster" "primary" {
   }
   
   maintenance_policy {
-    recurring_window {
-      start_time = "2022-01-01T00:00:00Z"
-      end_time   = "2022-01-01T04:00:00Z"
-      recurrence = "FREQ=WEEKLY;BYDAY=SA,SU"
+    daily_maintenance_window {
+      start_time = "03:00"
     }
   }
   
-  # Enable Network Policy
-  network_policy {
-    enabled  = true
-    provider = "CALICO"
-  }
+  logging_service    = "logging.googleapis.com/kubernetes"
+  monitoring_service = "monitoring.googleapis.com/kubernetes"
   
-  # Enable all needed addons
   addons_config {
     http_load_balancing {
       disabled = false
@@ -881,250 +894,186 @@ resource "google_container_cluster" "primary" {
       enabled = true
     }
   }
+  
+  network_policy {
+    enabled = true
+    provider = "CALICO"
+  }
+  
+  timeouts {
+    create = "30m"
+    update = "40m"
+  }
 }
 
-# ------------------------------------------------------------------------------
-# GKE NODE POOLS
-# ------------------------------------------------------------------------------
-resource "google_container_node_pool" "general" {
-  count      = var.environment == "production" ? 1 : 0
-  name       = "general"
-  location   = local.region
+resource "google_container_node_pool" "node_pools" {
+  for_each = { for i, pool in local.node_pools : pool.name => pool }
+  
+  name       = each.value.name
+  location   = var.region
   cluster    = google_container_cluster.primary.name
-  node_count = var.min_nodes
+  node_count = each.value.node_count
   
   autoscaling {
-    min_node_count = var.min_nodes
-    max_node_count = var.max_nodes
+    min_node_count = each.value.min_count
+    max_node_count = each.value.max_count
   }
   
   management {
-    auto_repair  = true
-    auto_upgrade = true
+    auto_repair  = each.value.auto_repair
+    auto_upgrade = each.value.auto_upgrade
   }
   
   node_config {
-    machine_type = local.machine_types["medium"]
-    disk_type    = "pd-ssd"
-    disk_size_gb = 100
-    
-    # Needed for gVisor
-    sandbox_config {
-      sandbox_type = "gvisor"
-    }
-    
-    # GCE default service account
-    service_account = google_service_account.gke.email
+    preemptible  = each.value.preemptible
+    machine_type = each.value.machine_type
+    disk_size_gb = each.value.disk_size_gb
+    disk_type    = each.value.disk_type
     
     oauth_scopes = [
       "https://www.googleapis.com/auth/cloud-platform"
     ]
     
-    labels = {
-      environment = var.environment
-      nodepool   = "general"
-    }
-    
-    # Enable workload identity
     workload_metadata_config {
       mode = "GKE_METADATA"
     }
-  }
-}
-
-resource "google_container_node_pool" "ml_compute" {
-  count      = var.environment == "production" ? 1 : 0
-  name       = "ml-compute"
-  location   = local.region
-  cluster    = google_container_cluster.primary.name
-  
-  autoscaling {
-    min_node_count = 0
-    max_node_count = 10
-  }
-  
-  management {
-    auto_repair  = true
-    auto_upgrade = true
-  }
-  
-  node_config {
-    machine_type = local.machine_types["large"]
-    disk_type    = "pd-ssd"
-    disk_size_gb = 200
     
-    # GPU configuration
-    guest_accelerator {
-      type  = "nvidia-tesla-t4"
-      count = 1
-      
-      # Configure GPU driver installation on startup
-      gpu_driver_installation_config {
-        gpu_driver_version = "LATEST"
+    labels = each.value.labels
+    
+    dynamic "taint" {
+      for_each = each.value.taints
+      content {
+        key    = taint.value.key
+        value  = taint.value.value
+        effect = taint.value.effect
       }
     }
     
-    # GCE default service account
-    service_account = google_service_account.gke.email
-    
-    oauth_scopes = [
-      "https://www.googleapis.com/auth/cloud-platform"
-    ]
-    
-    taint {
-      key    = "workload"
-      value  = "ml-training"
-      effect = "NO_SCHEDULE"
-    }
-    
-    labels = {
-      environment = var.environment
-      nodepool    = "ml-compute"
-      workload    = "ml-training"
-    }
-    
-    workload_metadata_config {
-      mode = "GKE_METADATA"
+    dynamic "guest_accelerator" {
+      for_each = each.value.accelerator_count > 0 ? [1] : []
+      content {
+        type  = each.value.accelerator_type
+        count = each.value.accelerator_count
+      }
     }
   }
 }
 
 # ------------------------------------------------------------------------------
-# SERVICE ACCOUNTS
-# ------------------------------------------------------------------------------
-resource "google_service_account" "gke" {
-  account_id   = "${local.name_prefix}-gke"
-  display_name = "Service Account for GKE Nodes"
-}
-
-resource "google_service_account" "ml_model" {
-  account_id   = "${local.name_prefix}-ml-model"
-  display_name = "Service Account for ML Model Service"
-}
-
-# Grant required roles to GKE service account
-resource "google_project_iam_member" "gke_log_writer" {
-  project = var.project_id
-  role    = "roles/logging.logWriter"
-  member  = "serviceAccount:${google_service_account.gke.email}"
-}
-
-resource "google_project_iam_member" "gke_metrics_writer" {
-  project = var.project_id
-  role    = "roles/monitoring.metricWriter"
-  member  = "serviceAccount:${google_service_account.gke.email}"
-}
-
-resource "google_project_iam_member" "gke_artifact_reader" {
-  project = var.project_id
-  role    = "roles/artifactregistry.reader"
-  member  = "serviceAccount:${google_service_account.gke.email}"
-}
-
-# Grant model service account access to storage
-resource "google_project_iam_member" "ml_storage_admin" {
-  project = var.project_id
-  role    = "roles/storage.objectAdmin"
-  member  = "serviceAccount:${google_service_account.ml_model.email}"
-}
-
-# Configure workload identity for model service
-resource "google_service_account_iam_binding" "ml_model_workload_identity" {
-  service_account_id = google_service_account.ml_model.name
-  role               = "roles/iam.workloadIdentityUser"
-  
-  members = [
-    "serviceAccount:${var.project_id}.svc.id.goog[ml-model/model-api]"
-  ]
-}
-
-# ------------------------------------------------------------------------------
-# DATABASE (CLOUD SQL)
+# CLOUD SQL (PostgreSQL)
 # ------------------------------------------------------------------------------
 resource "google_sql_database_instance" "postgres" {
   name             = "${local.name_prefix}-postgres"
   database_version = "POSTGRES_14"
-  region           = local.region
+  region           = var.region
+  
+  deletion_protection = var.environment == "production"
   
   settings {
-    tier = local.db_tiers[var.db_instance_type]
+    tier              = local.db_instance_types[var.db_instance_type]
+    availability_type = var.environment == "production" ? "REGIONAL" : "ZONAL"
+    
+    disk_size = 100
+    disk_type = "PD_SSD"
+    disk_autoresize = true
+    disk_autoresize_limit = 500
     
     backup_configuration {
-      enabled                        = true
-      binary_log_enabled             = false
-      start_time                     = "02:00"
-      point_in_time_recovery_enabled = true
-      transaction_log_retention_days = 7
+      enabled            = true
+      start_time         = "02:00"
+      binary_log_enabled = false
+      
       backup_retention_settings {
-        retained_backups = 7
+        retained_backups = var.environment == "production" ? 30 : 7
+        retention_unit   = "COUNT"
       }
     }
     
     maintenance_window {
-      day          = 7  # Sunday
-      hour         = 2
+      day          = 1  # Monday
+      hour         = 3
       update_track = "stable"
     }
     
     insights_config {
       query_insights_enabled  = true
-      query_string_length     = 1024
+      query_string_length     = 4096
       record_application_tags = true
-      record_client_address   = false
+      record_client_address   = true
     }
     
     ip_configuration {
-      ipv4_enabled    = var.environment != "production"
-      private_network = var.environment == "production" ? google_compute_network.vpc.self_link : null
+      ipv4_enabled    = false
+      private_network = google_compute_network.vpc_network.id
       require_ssl     = true
     }
     
     database_flags {
-      name  = "log_min_duration_statement"
-      value = "1000"
+      name  = "max_connections"
+      value = "500"
     }
     
     database_flags {
-      name  = "max_connections"
-      value = "100"
+      name  = "shared_buffers"
+      value = "4096MB"
     }
     
-    user_labels = local.common_tags
+    database_flags {
+      name  = "work_mem"
+      value = "64MB"
+    }
   }
   
-  deletion_protection = var.environment == "production" ? true : false
+  depends_on = [google_service_networking_connection.private_vpc_connection]
 }
 
-resource "google_sql_database" "database" {
+resource "google_sql_database" "mlflow_db" {
   name     = "mlmodels"
   instance = google_sql_database_instance.postgres.name
 }
 
-resource "random_password" "database_password" {
-  length  = 16
-  special = false
-}
-
-resource "google_sql_user" "user" {
-  name     = "mluser"
+resource "google_sql_user" "postgres_user" {
+  name     = "postgres"
   instance = google_sql_database_instance.postgres.name
-  password = random_password.database_password.result
+  password = random_password.postgres_password.result
+}
+
+resource "random_password" "postgres_password" {
+  length           = 16
+  special          = true
+  override_special = "_%@"
+}
+
+resource "google_compute_global_address" "private_ip_address" {
+  name          = "${local.name_prefix}-private-ip"
+  purpose       = "VPC_PEERING"
+  address_type  = "INTERNAL"
+  prefix_length = 16
+  network       = google_compute_network.vpc_network.id
+}
+
+resource "google_service_networking_connection" "private_vpc_connection" {
+  network                 = google_compute_network.vpc_network.id
+  service                 = "servicenetworking.googleapis.com"
+  reserved_peering_ranges = [google_compute_global_address.private_ip_address.name]
 }
 
 # ------------------------------------------------------------------------------
-# REDIS (MEMORYSTORE)
+# REDIS
 # ------------------------------------------------------------------------------
-resource "google_redis_instance" "redis" {
+resource "google_redis_instance" "cache" {
   name           = "${local.name_prefix}-redis"
-  display_name   = "ML Model Cache"
   tier           = local.redis_tiers[var.redis_node_type]
-  memory_size_gb = 1
+  memory_size_gb = 4
+  location_id    = var.region
   
-  region             = local.region
-  authorized_network = google_compute_network.vpc.id
-  
-  redis_version     = "REDIS_6_X"
+  redis_version      = "REDIS_6_X"
+  redis_configs      = {}
+  display_name       = "ML Model API Cache"
+  auth_enabled       = true
   transit_encryption_mode = "SERVER_AUTHENTICATION"
+  
+  authorized_network = google_compute_network.vpc_network.id
   
   maintenance_policy {
     weekly_maintenance_window {
@@ -1135,17 +1084,15 @@ resource "google_redis_instance" "redis" {
       }
     }
   }
-  
-  labels = local.common_tags
 }
 
 # ------------------------------------------------------------------------------
-# STORAGE (GCS)
+# GCS BUCKETS
 # ------------------------------------------------------------------------------
 resource "google_storage_bucket" "model_artifacts" {
-  name     = "${local.name_prefix}-model-artifacts"
-  location = local.region
-  
+  name                        = "${local.name_prefix}-model-artifacts"
+  location                    = var.region
+  storage_class               = "STANDARD"
   uniform_bucket_level_access = true
   
   versioning {
@@ -1162,86 +1109,100 @@ resource "google_storage_bucket" "model_artifacts" {
     }
   }
   
-  cors {
-    origin          = ["*"]
-    method          = ["GET", "HEAD", "PUT", "POST", "DELETE"]
-    response_header = ["*"]
-    max_age_seconds = 3600
+  lifecycle_rule {
+    condition {
+      age = 365
+    }
+    action {
+      type = "SetStorageClass"
+      storage_class = "COLDLINE"
+    }
   }
   
-  labels = local.common_tags
+  dynamic "lifecycle_rule" {
+    for_each = var.environment == "production" ? [] : [1]
+    content {
+      condition {
+        age = 30
+      }
+      action {
+        type = "Delete"
+      }
+    }
+  }
+  
+  labels = local.common_labels
 }
 
-resource "google_storage_bucket" "mlflow_artifacts" {
-  name     = "${local.name_prefix}-mlflow-artifacts"
-  location = local.region
-  
-  uniform_bucket_level_access = true
-  
-  versioning {
-    enabled = true
-  }
-  
-  cors {
-    origin          = ["*"]
-    method          = ["GET", "HEAD", "PUT", "POST", "DELETE"]
-    response_header = ["*"]
-    max_age_seconds = 3600
-  }
-  
-  labels = local.common_tags
+resource "google_storage_bucket_iam_binding" "model_artifacts_admin" {
+  bucket = google_storage_bucket.model_artifacts.name
+  role   = "roles/storage.admin"
+  members = [
+    "serviceAccount:${google_service_account.gke_sa.email}"
+  ]
 }
 
 # ------------------------------------------------------------------------------
-# CONTAINER REGISTRY
+# IAM & SERVICE ACCOUNTS
 # ------------------------------------------------------------------------------
-resource "google_artifact_registry_repository" "repository" {
-  location      = local.region
-  repository_id = "${local.name_prefix}-repo"
-  format        = "DOCKER"
+resource "google_service_account" "gke_sa" {
+  account_id   = "${local.name_prefix}-gke-sa"
+  display_name = "GKE Service Account for ML workloads"
+}
+
+resource "google_project_iam_member" "gke_sa_roles" {
+  for_each = toset([
+    "roles/storage.admin",
+    "roles/logging.logWriter",
+    "roles/monitoring.metricWriter",
+    "roles/artifactregistry.reader",
+    "roles/cloudsql.client"
+  ])
   
-  labels = local.common_tags
+  project = var.project_id
+  role    = each.value
+  member  = "serviceAccount:${google_service_account.gke_sa.email}"
 }
 
 # ------------------------------------------------------------------------------
 # OUTPUTS
 # ------------------------------------------------------------------------------
-output "kubernetes_cluster_name" {
+output "cluster_name" {
   description = "GKE cluster name"
   value       = google_container_cluster.primary.name
 }
 
-output "kubernetes_cluster_host" {
+output "cluster_endpoint" {
   description = "GKE cluster endpoint"
-  value       = "https://${google_container_cluster.primary.endpoint}"
+  value       = google_container_cluster.primary.endpoint
   sensitive   = true
 }
 
-output "db_connection_name" {
-  description = "Cloud SQL connection name"
-  value       = google_sql_database_instance.postgres.connection_name
+output "db_instance_name" {
+  description = "Cloud SQL instance name"
+  value       = google_sql_database_instance.postgres.name
 }
 
 output "db_name" {
   description = "Database name"
-  value       = google_sql_database.database.name
+  value       = google_sql_database.mlflow_db.name
 }
 
 output "db_user" {
   description = "Database user"
-  value       = google_sql_user.user.name
+  value       = google_sql_user.postgres_user.name
   sensitive   = true
 }
 
 output "db_password" {
   description = "Database password"
-  value       = google_sql_user.user.password
+  value       = google_sql_user.postgres_user.password
   sensitive   = true
 }
 
 output "redis_host" {
   description = "Redis hostname"
-  value       = google_redis_instance.redis.host
+  value       = google_redis_instance.cache.host
 }
 
 output "model_artifacts_bucket" {

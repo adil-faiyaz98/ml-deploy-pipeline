@@ -1,9 +1,9 @@
 # Project information
 project_name = "ml-deploy"
-environment  = "staging"
+environment  = "dev"  # dev, staging, production
 aws_region   = "us-west-2"
 owner        = "data-science-team"
-cost_center  = "ml-ops"
+cost_center  = "ml-research"
 
 # Cluster configuration
 kubernetes_version = "1.28"
@@ -21,8 +21,8 @@ redis_node_type = "cache.t3.medium"  # Use cache.m5.large or higher for producti
 
 # Security configuration
 management_ips = [
-  "10.0.0.0/16",  # VPN CIDR
-  "203.0.113.0/24" # Office CIDR
+  "192.168.1.0/24",  # Office network
+  "203.0.113.0/24"   # VPN network
 ]
 
 # IAM users with cluster access
@@ -31,11 +31,6 @@ aws_auth_users = [
     userarn  = "arn:aws:iam::123456789012:user/admin-user"
     username = "admin"
     groups   = ["system:masters"]
-  },
-  {
-    userarn  = "arn:aws:iam::123456789012:user/developer"
-    username = "developer"
-    groups   = ["developer"]
   }
 ]
 
@@ -45,4 +40,43 @@ deploy_monitoring    = true
 deploy_elastic_stack = true
 
 # Monitoring configuration
-grafana_admin_password = "change-me-immediately!"
+grafana_admin_password = "change-me-in-production"
+
+# ------------------------------------------------------------------------------
+# TERRAFORM VARIABLE VALUES
+# ------------------------------------------------------------------------------
+
+# Basic Settings
+cloud_provider = "aws"   # aws, azure, or gcp
+
+# Cloud Provider Specific Settings
+# AWS
+aws_vpc_cidr      = "10.0.0.0/16"
+aws_eks_admin_roles = [
+  "arn:aws:iam::123456789012:role/EKSAdminRole"
+]
+
+# Azure
+azure_location        = "eastus"
+azure_subscription_id = "00000000-0000-0000-0000-000000000000"
+azure_resource_group_name = "ml-deploy-rg"
+
+# GCP
+gcp_project_id = "my-gcp-project"
+gcp_region     = "us-central1"
+gcp_network_name = "ml-deploy-network"
+
+# Database Settings
+db_sku_name      = "GP_Gen5_4"     # Azure
+db_machine_type  = "db-custom-4-16384" # GCP
+
+# Redis Settings
+redis_sku        = "Standard"        # Azure
+redis_tier       = "STANDARD"        # GCP
+
+# Deployment Settings
+model_api_image      = "model-api:latest"
+model_trainer_image  = "model-trainer:latest"
+
+# Credentials (DO NOT store sensitive values in this file!)
+# Use environment variables, GitHub Secrets, or a vault instead

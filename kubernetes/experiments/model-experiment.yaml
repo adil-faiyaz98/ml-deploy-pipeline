@@ -1,0 +1,30 @@
+apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
+metadata:
+  name: model-api-experiments
+  namespace: ml-deploy
+spec:
+  hosts:
+  - "api.ml-deploy.example.com"
+  gateways:
+  - ml-deploy-gateway
+  http:
+  # Default model (90% of traffic)
+  - route:
+    - destination:
+        host: model-api-v1
+        port:
+          number: 8000
+      weight: 90
+    # Experimental model (10% of traffic)
+    - destination:
+        host: model-api-v2
+        port:
+          number: 8000
+      weight: 10
+    # Custom headers for logging the experiment
+    headers:
+      response:
+        set:
+          x-model-experiment: "a-b-test-001"
+          x-model-version: "split-v1-90-v2-10"

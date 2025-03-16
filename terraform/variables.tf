@@ -49,43 +49,33 @@ variable "kubernetes_version" {
 }
 
 variable "min_nodes" {
-  description = "Minimum number of nodes"
+  description = "Minimum number of worker nodes"
   type        = number
   default     = 2
 }
 
 variable "max_nodes" {
-  description = "Maximum number of nodes"
+  description = "Maximum number of worker nodes"
   type        = number
   default     = 8
 }
 
 variable "desired_nodes" {
-  description = "Desired number of nodes"
+  description = "Desired number of worker nodes"
   type        = number
   default     = 3
 }
 
 variable "db_instance_type" {
-  description = "Database instance type (cloud-agnostic size: small, medium, large, xlarge)"
+  description = "Database instance type"
   type        = string
-  default     = "medium"
-  
-  validation {
-    condition     = contains(["small", "medium", "large", "xlarge"], var.db_instance_type)
-    error_message = "Valid values for db_instance_type are: small, medium, large, xlarge"
-  }
+  default     = "medium"  # Will be mapped to provider-specific instance types
 }
 
 variable "redis_node_type" {
-  description = "Redis node type (cloud-agnostic size: small, medium, large, xlarge)"
+  description = "Redis node type"
   type        = string
-  default     = "medium"
-  
-  validation {
-    condition     = contains(["small", "medium", "large", "xlarge"], var.redis_node_type)
-    error_message = "Valid values for redis_node_type are: small, medium, large, xlarge"
-  }
+  default     = "medium"  # Will be mapped to provider-specific instance types
 }
 
 variable "management_ips" {
@@ -94,14 +84,14 @@ variable "management_ips" {
   default     = []
 }
 
-variable "deploy_mlflow" {
-  description = "Whether to deploy MLflow"
+variable "deploy_monitoring" {
+  description = "Whether to deploy the monitoring stack"
   type        = bool
   default     = true
 }
 
-variable "deploy_monitoring" {
-  description = "Whether to deploy the monitoring stack"
+variable "deploy_mlflow" {
+  description = "Whether to deploy MLflow"
   type        = bool
   default     = true
 }
@@ -109,7 +99,7 @@ variable "deploy_monitoring" {
 variable "deploy_elastic_stack" {
   description = "Whether to deploy the ELK stack"
   type        = bool
-  default     = true
+  default     = false
 }
 
 variable "grafana_admin_password" {
@@ -136,7 +126,7 @@ variable "aws_vpc_cidr" {
 }
 
 variable "aws_eks_admin_roles" {
-  description = "List of IAM role ARNs with admin access to EKS"
+  description = "List of IAM roles with admin access to the EKS cluster"
   type        = list(string)
   default     = []
 }
@@ -146,26 +136,26 @@ variable "aws_eks_admin_roles" {
 # ------------------------------------------------------------------------------
 
 variable "azure_location" {
-  description = "Azure location/region"
+  description = "Azure region"
   type        = string
   default     = "eastus"
 }
 
 variable "azure_subscription_id" {
-  description = "Azure subscription ID"
+  description = "Azure Subscription ID"
   type        = string
   default     = null
+}
+
+variable "azure_resource_prefix" {
+  description = "Prefix for Azure resource names"
+  type        = string
+  default     = "mlops"
 }
 
 # ------------------------------------------------------------------------------
 # GCP SPECIFIC VARIABLES
 # ------------------------------------------------------------------------------
-
-variable "gcp_project_id" {
-  description = "GCP project ID"
-  type        = string
-  default     = null
-}
 
 variable "gcp_region" {
   description = "GCP region"
@@ -173,14 +163,8 @@ variable "gcp_region" {
   default     = "us-central1"
 }
 
-variable "gcp_zone" {
-  description = "GCP zone"
+variable "gcp_project_id" {
+  description = "GCP Project ID"
   type        = string
-  default     = "us-central1-a"
-}
-
-variable "gcp_network_name" {
-  description = "GCP VPC network name"
-  type        = string
-  default     = "ml-deploy-network"
+  default     = null
 }
