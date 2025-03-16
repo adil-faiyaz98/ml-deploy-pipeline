@@ -379,75 +379,64 @@ class GradientBoostingModel(MLModel):
         elif self.implementation == "lightgbm":
             if not path.endswith('.lgb'):
                 path = f"{path}.lgb"
-            self.model.booster_.save_model(path)
+            self.model.save_model(path)
             
         self.logger.info(f"Model saved to {path}")
         
         # Save additional metadata
         metadata = {
-            'model_name': self.model_name,
-            'model_type': self.model_type,
-            'implementation': self.implementation,
-            'params': self.params,
-            'feature_names': self.feature_names
+            "model_name": self.model_name,
+            "model_type": self.model_type,
+            "implementation": self.implementation,
+            "params": self.params,
+            "feature_names": self.feature_names
         }
-        
         metadata_path = f"{path.rsplit('.', 1)[0]}_metadata.json"
-        with open(metadata_path, 'w') as f:
+        with open(metadata_path, "w") as f:
             json.dump(metadata, f)
-            
         self.logger.info(f"Model metadata saved to {metadata_path}")
         
     @classmethod
-    def load(cls, path: str) -> 'GradientBoostingModel':
+    def load(cls, path: str) -> "GradientBoostingModel":
         """
         Load model from disk.
         
         Args:
-            path: Path to load the model from
+            path: Path to the saved model
             
         Returns:
-            Loaded model
+            Loaded GradientBoostingModel instance
         """
-        # Determine implementation from file extension
-        if path.endswith('.pkl'):
-            implementation = "sklearn"
-        elif path.endswith('.xgb'):
-            implementation = "xgboost"
-        elif path.endswith('.lgb'):
-            implementation = "lightgbm"
-        else:
-            raise ValueError(f"Unknown file extension for: {path}")
-            
         # Load metadata
         metadata_path = f"{path.rsplit('.', 1)[0]}_metadata.json"
-        with open(metadata_path, 'r') as f:
+        with open(metadata_path, "r") as f:
             metadata = json.load(f)
-            
-        # Create model instance
-        model_instance = cls(
-            model_name=metadata['model_name'],
-            model_type=metadata['model_type'],
-            implementation=metadata['implementation'],
-            **{k: v for k, v in metadata['params'].items() if k not in ['model_name', 'model_type', 'implementation']}
+        
+        # Create instance with metadata
+        instance = cls(
+            model_name=metadata["model_name"],
+            model_type=metadata["model_type"],
+            implementation=metadata["implementation"],
+            **metadata["params"]
         )
+        instance.feature_names = metadata.get("feature_names")
         
-        # Load the actual model
-        if implementation == "sklearn":
-            model_instance.model = joblib.load(path)
-        elif implementation == "xgboost":
-            if metadata['model_type'] == 'classification':
-                model_instance.model = xgb.XGBClassifier()
+        # Load model based on implementation
+        if metadata["implementation"] == "sklearn":
+            if not path.endswith('.pkl'):
+                path = f"{path}.pkl"
+            instance.model = joblib.load(path)
+        elif metadata["implementation"] == "xgboost":
+            if not path.endswith('.xgb'):
+                path = f"{path}.xgb"
+            if metadata["model_type"] == "classification":
+                instance.model = xgb.XGBClassifier()
             else:
-                model_instance.model = xgb.XGBRegressor()
-            model_instance.model.load_model(path)
-        elif implementation == "lightgbm":
-            if metadata['model_type'] == 'classification':
-                model_instance.model = lgb.LGBMClassifier()
-            else:
-                model_instance.model = lgb.LGBMRegressor()
-            model_instance.model.booster_ = lgb.Booster(model_file=path)
+                instance.model = xgb.XGBRegressor()
+            instance.model.load_model(path)
+        elif metadata["implementation"] == "lightgbm":
+            if not path.endswith('.lgb'):
+                path = f"{path}.lgb"
+            instance.model = lgb.Booster(model_file=path)
             
-        model_instance.feature_names = metadata['feature_names']
-        
-        return model_instance
+        return instance
